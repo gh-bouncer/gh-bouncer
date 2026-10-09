@@ -448,7 +448,7 @@ wrong_base() {  # <is the pull request closed: yes|no>
 note_explained() {  # why a signed review of this commit doesn't count
   case "$1" in
     config_changed) printf '%s' "the maintainers changed the bouncer settings after it ran" ;;
-    outdated) printf '%s' "it was made with an outdated version of the bouncer review" ;;
+    outdated) printf '%s' "it was made with a version of the bouncer review that the project's bouncer doesn't accept" ;;
   esac
 }
 
@@ -594,7 +594,7 @@ if ! has_workflow "$DEFAULT_BRANCH"; then
   has_workflow "$DEFAULT_BRANCH" || die "$UPSTREAM has no $WORKFLOW_PATH on its default branch, so there's no review to run." \
     "Bouncer may have been removed from the project. Ask its maintainers."
 elif [ "$NOTE" = "outdated" ]; then
-  sync_fork "Your fork's bouncer workflow is out of date"
+  sync_fork "Your fork's bouncer workflow may be out of date"
 fi
 # Reviews on push run the workflow from the pushed branch, so they need it there too.
 AUTO=""
@@ -924,7 +924,8 @@ case "$RESULT" in
       config_changed) die "Your review doesn't count: $(note_explained "$B_NOTE")." \
         "Run gh bouncer $PR_URL again. This doesn't use up a review attempt." ;;
       outdated) die "Your review doesn't count: $(note_explained "$B_NOTE")." \
-        "Run gh bouncer $PR_URL again: it syncs your fork first. This doesn't use up a review attempt." ;;
+        "Run gh bouncer $PR_URL again: it syncs your fork first. This doesn't use up a review attempt." \
+        "If it happens again after that, let the project's maintainers know: their bouncer may be pinned to an older version." ;;
       verify_error) warn "The bouncer couldn't verify your signed review yet. It tries again every 10 minutes." ;;
       *) warn "The bouncer hasn't posted the result yet. It says: $B_NOTE" ;;
     esac ;;

@@ -104,6 +104,7 @@ check() {  # extra assertions per test
     run-out-of-credits) has "Nothing was signed, so this doesn't use up a review attempt." &&
                         has "gh run view 4242 -R fork/repo --log-failed" && ! called '^pr comment' ;;
     run-fails-after-signing) has "but the review was signed, so it counts" ;;
+    verdict-outdated) has "it syncs your fork first" && has "let the project's maintainers know" ;;
     bounce) has "  • \`not-duplicate\` (Required, 92% confidence)" && has "To try again (2 review attempts left):" &&
             has "Don't force-push" && has "2. Reopen the pull request." && has "3. Run gh bouncer $URL" && has "Full review: $REPORT" ;;
     bounce-open) has "A new review usually starts on your key" && has "still asks for one, run gh bouncer again." ;;
@@ -217,7 +218,7 @@ run reuse-signed-run    0 "Your fork already reviewed this commit"            ha
 run skipped-push-run    0 "Started the review"                                has_secret run_push_skipped -- "$URL"
 run followed-run-skipped 0 "That run didn't review your pull request"         has_secret run_push_running followed_run_skips -- "$URL"
 S_STATE="$(st pending '"note":"config_changed"')" run config-changed-rerun 0 "doesn't count: the maintainers changed the bouncer settings" has_secret run_push_signed -- "$URL"
-S_STATE="$(st pending '"note":"outdated"')" run outdated-syncs 0 "Your fork's bouncer workflow is out of date. Syncing" has_secret -- "$URL"
+S_STATE="$(st pending '"note":"outdated"')" run outdated-syncs 0 "Your fork's bouncer workflow may be out of date. Syncing" has_secret -- "$URL"
 ctrl_c ctrl-c-watching "run watch" "Stopped watching. The review is still running: https://github.com/fork/repo/actions/runs/4242" has_secret slow_watch -- "$URL"
 
 # --- when the review run fails: say why, and that nothing was used up
@@ -234,6 +235,7 @@ S_VERDICT="$(st fail '"left":0')" run bounce-last 1 "No review attempts left."  
 run verdict-timeout     0 "The bouncer hasn't posted the result yet."         has_secret verdict_pending -- "$URL"
 S_VERDICT="$(st pass | sed "s/$SHA/$OLD/")" NOT="Passed" run verdict-other-commit 0 "The bouncer hasn't posted the result yet." has_secret -- "$URL"
 S_VERDICT="$(st pending '"note":"config_changed"')" run verdict-config-changed 1 "Your review doesn't count: the maintainers changed" has_secret -- "$URL"
+S_VERDICT="$(st pending '"note":"outdated"')" run verdict-outdated 1 "a version of the bouncer review that the project's bouncer doesn't accept" has_secret -- "$URL"
 S_VERDICT="$(st pending '"note":"verify_error"')" run verdict-verify-error 0 "couldn't verify your signed review yet" has_secret -- "$URL"
 S_VERDICT="$(st quarantined)" run verdict-unknown 0 "which this version of gh bouncer doesn't know" has_secret -- "$URL"
 S_STATE='{"sha":"'$SHA'","status":"pending"}' S_VERDICT='{"sha":"'$SHA'","status":"pass"}' run verdict-old-bouncer 0 "Passed." has_secret -- "$URL"
