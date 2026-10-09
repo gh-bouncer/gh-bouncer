@@ -107,6 +107,7 @@ ENVIRONMENT
 EXIT CODES
   0  The review finished, or was started with --no-watch
   1  Something went wrong, or the review run failed
+  2  Stopped with Ctrl-C (the review keeps running)
   4  Not logged in to GitHub CLI
 
 EXAMPLES
@@ -661,43 +662,171 @@ if [ "$rc" != 0 ]; then
 fi
 if [ "$has_key" = "0" ] || [ "$SET_KEY" = 1 ]; then ask_key; fi
 
-# --- start the review ----------------------------------------------------------------
-latest_run() {
+# --- start the review, or follow one that's already running ---------------------------
+# Only the first signed review of a commit counts, and each one is billed to your key, so
+# don't start another while one is running or after one is done. Reviews on push are found
+# by commit; manual ones are named "Bouncer review · PR #N".
+RUN_JQ='.[] | [.databaseId, .status, .conclusion, .event, .displayTitle]
+  | map(tostring | gsub("[\\t\\r\\n]+"; " ") | if . == "" then "-" else . end) | join("\t")'
+RUN_ID=""
+RUN_HOW=""      # started, running (someone else's run of this commit), signed (finished and signed)
+LAST_DISPATCH=0 # the newest manual run before ours
+is_ours() { [ "$1" = "push" ] || [[ "$2" == *"PR #$NUMBER" ]]; }
+# read_run <run id>: R_CONCLUSION, R_FAILED_JOBS (comma-separated), R_SIGNED (non-empty if signed)
+RUN_VIEW_JQ='[.conclusion, ([.jobs[] | select(.conclusion == "failure") | .databaseId | tostring] | join(",")),
+  ([.jobs[].steps[]? | select((.name | startswith("Sign")) and .conclusion == "success")] | length | tostring)]
+  | map(if . == "" or . == null then "-" else . end) | join("\t")'
+read_run() {
+  local info
+  info="$(ghc run view "$1" -R "$HEAD_REPO" --json conclusion,jobs --jq "$RUN_VIEW_JQ" </dev/null)" || return $?
+  IFS=$'\t' read -r R_CONCLUSION R_FAILED_JOBS R_SIGNED <<<"$info"
+  [ "$R_CONCLUSION" != "-" ] || R_CONCLUSION=""
+  [ "$R_FAILED_JOBS" != "-" ] || R_FAILED_JOBS=""
+  [ "$R_SIGNED" != "0" ] || R_SIGNED=""
+}
+find_review() {
+  local by_commit manual id status conclusion event title rc
+  by_commit="$(ghc run list -R "$HEAD_REPO" -w "$WORKFLOW" --commit "$HEAD_SHA" -L 20 \
+    --json databaseId,status,conclusion,event,displayTitle --jq "$RUN_JQ")" || gh_failed $?
+  manual="$(ghc run list -R "$HEAD_REPO" -w "$WORKFLOW" -e workflow_dispatch -L 20 \
+    --json databaseId,status,conclusion,event,displayTitle --jq "$RUN_JQ")" || gh_failed $?
+  while IFS=$'\t' read -r id status conclusion event title; do
+    [ -n "$id" ] || continue
+    if [ "$event" = "workflow_dispatch" ] && [ "$id" -gt "$LAST_DISPATCH" ]; then LAST_DISPATCH="$id"; fi
+    if [ "$status" != "completed" ] && is_ours "$event" "$title"; then
+      RUN_ID="$id" RUN_HOW="running"
+      return 0
+    fi
+  done <<<"$by_commit"$'\n'"$manual"
+  # A finished, signed review of this commit, unless the bouncer said it doesn't count.
+  case "$NOTE" in config_changed|outdated) return 0 ;; esac
+  while IFS=$'\t' read -r id status conclusion event title; do
+    if [ "$event" != "push" ] || [ "$conclusion" != "success" ]; then continue; fi
+    rc=0
+    read_run "$id" || rc=$?
+    [ "$rc" = 0 ] || gh_failed "$rc"
+    if [ -n "$R_SIGNED" ]; then
+      RUN_ID="$id" RUN_HOW="signed"
+      return 0
+    fi
+  done <<<"$by_commit"
+}
+newest_dispatch() {
   ghc run list -R "$HEAD_REPO" -w "$WORKFLOW" -e workflow_dispatch -L 20 --json databaseId \
     --jq 'map(.databaseId) | max // 0' || echo 0
 }
-before="$(latest_run)"
-resp="$(api -X POST "repos/$HEAD_REPO/actions/workflows/$WORKFLOW/dispatches" \
-  -f ref="$DEFAULT_BRANCH" -f "inputs[pr]=$NUMBER" -F return_run_details=true)" || {
-  reachable $?
-  die "GitHub wouldn't start the review: $(gh_msg)" "See https://github.com/$HEAD_REPO/actions/workflows/$WORKFLOW"
+start_review() {
+  local before="$LAST_DISPATCH" resp rc=0
+  local args=(-X POST "repos/$HEAD_REPO/actions/workflows/$WORKFLOW/dispatches" -f ref="$DEFAULT_BRANCH" -f "inputs[pr]=$NUMBER")
+  resp="$(api "${args[@]}" -f "inputs[upstream]=$UPSTREAM" -F return_run_details=true)" || rc=$?
+  if [ "$rc" != 0 ] && grep -q 'Unexpected inputs' "$ERRF" && grep -q 'upstream' "$ERRF"; then
+    # A workflow from before the upstream input. Fine when the fork comes straight from the project.
+    direct_fork || die "Your fork's bouncer workflow is too old to review a pull request from a fork of a fork." \
+      "Merge the latest $UPSTREAM into $HEAD_REPO:$DEFAULT_BRANCH and push, then run gh bouncer again." \
+      "If that doesn't help, the project's bouncer needs an update. Ask its maintainers."
+    rc=0
+    resp="$(api "${args[@]}" -F return_run_details=true)" || rc=$?
+  fi
+  if [ "$rc" != 0 ]; then
+    reachable "$rc"
+    if grep -q "workflow_dispatch" "$ERRF"; then
+      die "The bouncer workflow on $HEAD_REPO:$DEFAULT_BRANCH is out of date, so gh bouncer can't start it." \
+        "Use Sync fork on https://github.com/$HEAD_REPO, then run gh bouncer again."
+    fi
+    die "GitHub wouldn't start the review: $(gh_msg)" "See https://github.com/$HEAD_REPO/actions/workflows/$WORKFLOW"
+  fi
+  RUN_ID="$(printf '%s' "$resp" | sed -n 's/.*"workflow_run_id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+  local i=0 now
+  while [ -z "$RUN_ID" ] && [ "$i" -lt 10 ]; do
+    sleep "$POLL_SECONDS"
+    now="$(newest_dispatch)"
+    if [ "$now" -gt "$before" ]; then RUN_ID="$now"; fi
+    i=$((i + 1))
+  done
+  [ -n "$RUN_ID" ] || die "The review started, but its run didn't show up yet." \
+    "Follow it at https://github.com/$HEAD_REPO/actions/workflows/$WORKFLOW"
+  RUN_HOW="started"
+  ok "Started the review"
 }
 
-run_id="$(printf '%s' "$resp" | sed -n 's/.*"workflow_run_id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
-i=0
-while [ -z "$run_id" ] && [ "$i" -lt 10 ]; do
-  sleep "$POLL_SECONDS"
-  now="$(latest_run)"
-  if [ "$now" -gt "$before" ]; then run_id="$now"; fi
-  i=$((i + 1))
+stopped_watching() {
+  say ""
+  warn "Stopped watching. The review is still running: $RUN_URL"
+  gray "The bouncer posts the result on $PR_URL within about 10 minutes of it finishing."
+  exit 2
+}
+EXPLAINED=""
+watch_run() {
+  RUN_URL="https://github.com/$HEAD_REPO/actions/runs/$RUN_ID"
+  gray "$RUN_URL"
+  if [ -z "$EXPLAINED" ]; then
+    say ""
+    say "Reviews usually take a few minutes. Ctrl-C stops watching; the review keeps running"
+    say "and the bouncer still posts the result on the pull request."
+    say ""
+    EXPLAINED=1
+  fi
+  trap stopped_watching INT
+  gh run watch "$RUN_ID" -R "$HEAD_REPO" --interval 10 >&2 || true
+  trap - INT
+}
+run_failed() {
+  local why="" job msg
+  [ "$R_CONCLUSION" != "cancelled" ] || die "The review was cancelled before it was signed, so it doesn't count." \
+    "Nothing was signed, so this doesn't use up a review attempt." "Run gh bouncer $PR_URL to start a new one."
+  [ "$R_CONCLUSION" != "timed_out" ] || why="it ran out of time"
+  # The review explains what went wrong (key, credits, rate limits...) in an error annotation.
+  for job in ${R_FAILED_JOBS//,/ }; do
+    msg="$(api "repos/$HEAD_REPO/check-runs/$job/annotations" --jq '.[] | select(.annotation_level == "failure")
+      | .message | select(startswith("Process completed with exit code") | not)' | head -n 1)" || true
+    if [ -n "$msg" ]; then why="$msg"; break; fi
+  done
+  die "The review didn't finish${why:+: $why}" "Nothing was signed, so this doesn't use up a review attempt." \
+    "Logs: gh run view $RUN_ID -R $HEAD_REPO --log-failed"
+}
+
+find_review
+case "$RUN_HOW" in
+  running) ok "A review of this commit is already running in your fork. Following it instead of starting another." ;;
+  signed)
+    ok "Your fork already reviewed this commit, and GitHub signed it."
+    gray "https://github.com/$HEAD_REPO/actions/runs/$RUN_ID" ;;
+  *) start_review ;;
+esac
+while [ "$RUN_HOW" != "signed" ]; do
+  if [ "$WATCH" = 0 ]; then
+    gray "https://github.com/$HEAD_REPO/actions/runs/$RUN_ID"
+    gray "The bouncer posts the result on $PR_URL within about 10 minutes of the review finishing."
+    exit 0
+  fi
+  watch_run
+  rc=0
+  read_run "$RUN_ID" || rc=$?
+  say ""
+  if [ "$rc" != 0 ]; then
+    reachable "$rc"
+    die "Couldn't tell how the review ended: $(gh_msg)" "See $RUN_URL. If it finished, the bouncer posts the result on $PR_URL."
+  fi
+  if [ "$R_CONCLUSION" = "success" ] && [ -z "$R_SIGNED" ] && [ "$RUN_HOW" = "running" ]; then
+    # An automatic run with nothing to do, e.g. one that started before your key was saved.
+    warn "That run didn't review your pull request, so gh bouncer is starting a review."
+    start_review
+    continue
+  fi
+  if [ "$R_CONCLUSION" != "success" ] && [ -z "$R_SIGNED" ]; then run_failed; fi
+  [ "$R_CONCLUSION" = "success" ] || warn "A step after signing failed, but the review was signed, so it counts."
+  ok "Review finished and signed by GitHub"
+  RUN_HOW="signed"
 done
-[ -n "$run_id" ] || die "The review started, but its run didn't show up yet." \
-  "Follow it at https://github.com/$HEAD_REPO/actions/workflows/$WORKFLOW"
 
-ok "Started the review"
-gray "https://github.com/$HEAD_REPO/actions/runs/$run_id"
-if [ "$WATCH" = "0" ]; then
-  gray "The bouncer posts the result on $PR_URL within about 10 minutes of the review finishing."
-  exit 0
-fi
-
-gh run watch "$run_id" -R "$HEAD_REPO" --exit-status --interval 10 >&2 ||
-  die "The review run failed." "See why with: gh run view $run_id -R $HEAD_REPO --log-failed"
-
+# --- tell the project's bouncer ---------------------------------------------------------------
 ghc pr comment "$NUMBER" -R "$UPSTREAM" --body "/bouncer check" >/dev/null ||
   warn "Couldn't ask the bouncer to check right away. It checks every 10 minutes on its own."
-ok "Review finished. The bouncer is checking the signed review now."
-gray "The result will appear on $PR_URL"
+if [ "$WATCH" = 0 ]; then
+  gray "The bouncer posts the result on $PR_URL"
+  exit 0
+fi
+gray "The bouncer is checking it now. The result will appear on $PR_URL"
 
 auto_note() {
   if [ -n "$AUTO" ]; then

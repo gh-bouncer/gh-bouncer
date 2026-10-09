@@ -4,6 +4,7 @@
 # flag files in $STUB and a few variables:
 #   S_STATE    the bouncer's state JSON before /bouncer check ("none": no state comment)
 #   S_LABELS   the pull request's labels, comma-separated (default: bouncer:pending)
+#   S_ANNOTATION  the review's failure annotation
 #   HEAD_REF, DEFAULT_BRANCH
 printf '%s\n' "$*" >>"$STUB/calls.log"
 [ -z "${ANTHROPIC_API_KEY:-}" ] || echo "LEAK: ANTHROPIC_API_KEY in gh's environment" >>"$STUB/calls.log"
@@ -55,6 +56,11 @@ pr() {
 }
 runs() {  # the fork's runs of bouncer.yml
   local r='{"databaseId":100,"status":"completed","conclusion":"success","event":"workflow_dispatch","headSha":"cccc","displayTitle":"Bouncer review · PR #7"}'
+  flag run_push_signed && r="$r"',{"databaseId":3030,"status":"completed","conclusion":"success","event":"push","headSha":"'$SHA'","displayTitle":"Bouncer review"}'
+  flag run_push_skipped && r="$r"',{"databaseId":3033,"status":"completed","conclusion":"success","event":"push","headSha":"'$SHA'","displayTitle":"Bouncer review"}'
+  flag run_push_running && r="$r"',{"databaseId":3131,"status":"in_progress","conclusion":"","event":"push","headSha":"'$SHA'","displayTitle":"Bouncer review"}'
+  flag run_other_pr_running && r="$r"',{"databaseId":3200,"status":"in_progress","conclusion":"","event":"workflow_dispatch","headSha":"cccc","displayTitle":"Bouncer review · PR #17"}'
+  flag run_dispatch_running && r="$r"',{"databaseId":3232,"status":"queued","conclusion":"","event":"workflow_dispatch","headSha":"cccc","displayTitle":"Bouncer review · PR #7"}'
   flag dispatched && r="$r"',{"databaseId":555,"status":"queued","conclusion":"","event":"workflow_dispatch","headSha":"cccc","displayTitle":"Bouncer review · PR #7"}'
   printf '[%s]' "$r"
 }
@@ -63,6 +69,10 @@ run_view() {  # run_view <id>: conclusion and jobs
   case "$1" in
     4242|555)
       flag run_fails && { c=failure; signed=false; }
+      flag run_cancelled && { c=cancelled; signed=false; }
+      flag run_fails_after_signing && c=failure ;;
+    3131) flag followed_run_skips && signed=false ;;
+    3033) signed=false ;;
   esac
   jq -n --arg c "$c" --argjson signed "$signed" '
     {conclusion: $c, jobs: [
@@ -133,10 +143,21 @@ case "$*" in
     runs | jq --arg c "$commit" --arg e "$event" \
       '[.[] | select(($c == "" or .headSha == $c) and ($e == "" or .event == $e))] | sort_by(-.databaseId)' | out ;;
   "api -X POST repos/fork/repo/actions/workflows/bouncer.yml/dispatches "*)
+    if flag dispatch_old_workflow && [[ "$*" == *"inputs[upstream]"* ]]; then fail 'gh: Unexpected inputs provided: ["upstream"] (HTTP 422)'; fi
+    flag dispatch_no_trigger && fail "gh: Workflow does not have 'workflow_dispatch' trigger (HTTP 422)"
     touch "$STUB/dispatched"
     flag dispatch_204 || echo '{"workflow_run_id":4242,"run_url":"https://api.github.com/repos/fork/repo/actions/runs/4242","html_url":"https://github.com/fork/repo/actions/runs/4242"}' ;;
   "run watch "*)
+    if flag slow_watch; then echo "Refreshing run status every 10 seconds. Press Ctrl+C to quit."; sleep 30; fi
     watch "$3" "$@" ;;
+  "run view "*) flag run_view_fails && fail "error connecting to api.github.com"; run_view "$3" | out ;;
+  "api repos/fork/repo/check-runs/9001/annotations "*)
+    if flag no_annotation; then
+      echo '[{"annotation_level":"failure","message":"Process completed with exit code 1."}]'
+    else
+      jq -n --arg m "${S_ANNOTATION:-Your Anthropic account is out of credits. Add credits at https://console.anthropic.com/settings/billing, then run gh bouncer $PR_URL again.}" \
+        '[{annotation_level: "failure", message: "Process completed with exit code 1."}, {annotation_level: "notice", message: "bouncer abc"}, {annotation_level: "failure", message: $m}]'
+    fi | out ;;
   "pr comment 7 -R up/repo --body /bouncer check") touch "$STUB/checked" ;;
 
   # --- init ---

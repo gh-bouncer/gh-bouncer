@@ -8,7 +8,7 @@ command -v jq >/dev/null || { echo "test/run.sh needs jq: the stub applies the s
 pass=0 fail=0
 
 URL=https://github.com/up/repo/pull/7
-DONE="The bouncer is checking the signed review now."
+DONE="The bouncer is checking it now."
 SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 OLD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 REPORT="$URL#issuecomment-2002"
@@ -30,6 +30,24 @@ run() {
     GH_BOUNCER_POLL_SECONDS=0 GH_BOUNCER_VERDICT_SECONDS=0 GH_BOUNCER_VERDICT_TRIES=3 ANTHROPIC_API_KEY="${KEY:-}" \
     "$BIN" "$@" </dev/null 2>&1)"
   verdict "$name" "$want_code" "$want_text" $?
+}
+# ctrl_c <name> <gh call to wait for> <expected text> [stub flags...] -- [args...]: press Ctrl-C
+# (SIGINT to the whole process group, as a terminal does) once that call has started.
+ctrl_c() {
+  local name="$1" when="$2" want_text="$3" pid code; shift 3
+  [ -z "$ONLY" ] || [[ "$name" == *"$ONLY"* ]] || return 0
+  setup "$@"; shift "$SHIFT"
+  set -m
+  env -u NO_COLOR -u CLICOLOR -u CLICOLOR_FORCE -u GH_FORCE_TTY PATH="$HERE:$PATH" GH_BOUNCER_POLL_SECONDS=0 \
+    GH_BOUNCER_VERDICT_SECONDS=30 ANTHROPIC_API_KEY= "$BIN" "$@" </dev/null >"$STUB/out" 2>&1 &
+  pid=$!
+  set +m
+  for _ in $(seq 100); do grep -q -- "^$when" "$STUB/calls.log" 2>/dev/null && break; sleep 0.05; done
+  sleep 0.3
+  kill -INT -- "-$pid"
+  wait "$pid"; code=$?
+  out="$(cat "$STUB/out")"
+  verdict "$name" 2 "$want_text" "$code"
 }
 setup() {  # flag files for the stub, up to --
   STUB="$(mktemp -d)"; export STUB
@@ -59,7 +77,8 @@ dispatches() { grep -c 'dispatches' "$STUB/calls.log"; }
 
 check() {  # extra assertions per test
   case "$1" in
-    pass) called "dispatches -f ref=main -f inputs\[pr\]=7 " && called '^pr comment 7 -R up/repo --body /bouncer check$' &&
+    pass) called "dispatches -f ref=main -f inputs\[pr\]=7 -f inputs\[upstream\]=up/repo" &&
+          called '^pr comment 7 -R up/repo --body /bouncer check$' &&
           has "Deadline 2026-10-11 12:00 UTC · 3 review attempts left" ;;
     number-repo-flag) ! called '^repo view' ;;
     key-from-env|key-trimmed) [ "$(cat "$STUB/secret_value")" = "sk-ant-test" ] && ! called 'sk-ant' ;;
@@ -69,12 +88,22 @@ check() {  # extra assertions per test
     enable) [ -f "$STUB/wf_enabled" ] ;;
     sync) [ -f "$STUB/synced" ] && has "$DONE" ;;
     sync-lag) [ -f "$STUB/synced" ] ;;
+    fork-of-fork) called 'inputs\[upstream\]=up/repo' ;;
     fork-of-fork-no-workflow|sync-own-branch) ! called 'merge-upstream' ;;
+    dispatch-old-workflow) [ "$(dispatches)" = 2 ] && [ "$(grep dispatches "$STUB/calls.log" | tail -n 1 | grep -c upstream)" = 0 ] ;;
     dispatch-204) called '^run watch 555 ' ;;
     no-watch) ! called '^run watch' && ! called '^pr comment' ;;
     branch-no-workflow) called 'contents/.github/workflows/bouncer.yml -f ref=feature' &&
                         has "run gh bouncer again after each push" ;;
+    follow-push-run) [ "$(dispatches)" = 0 ] && called '^run watch 3131 ' && has "$DONE" ;;
+    follow-manual-run) [ "$(dispatches)" = 0 ] && called '^run watch 3232 ' ;;
+    other-pr-run|skipped-push-run|config-changed-rerun) [ "$(dispatches)" = 1 ] && called '^run watch 4242 ' ;;
+    reuse-signed-run) [ "$(dispatches)" = 0 ] && ! called '^run watch' && called '^pr comment' && has "$DONE" ;;
+    followed-run-skipped) called '^run watch 3131 ' && called '^run watch 4242 ' && [ "$(dispatches)" = 1 ] && has "$DONE" ;;
     outdated-syncs) called 'merge-upstream' && [ "$(dispatches)" = 1 ] ;;
+    run-out-of-credits) has "Nothing was signed, so this doesn't use up a review attempt." &&
+                        has "gh run view 4242 -R fork/repo --log-failed" && ! called '^pr comment' ;;
+    run-fails-after-signing) has "but the review was signed, so it counts" ;;
     closed-bounced) has "Don't force-push" && has "  • \`correct\`" && [ "$(dispatches)" = 0 ] ;;
     merged|closed*|already-passed|skip-label|not-waiting|override|open-*|fail-label-stale|from-upstream|fork-deleted)
       [ "$(dispatches)" = 0 ] && ! called 'secret' ;;
@@ -171,11 +200,26 @@ run secret-list-fails   0 "Couldn't check your fork's secrets"                ha
 
 # --- starting the review, or following one: never pay twice for a commit
 run dispatch-204        0 "$DONE"                                           has_secret dispatch_204 -- "$URL"
+run dispatch-old-workflow 0 "$DONE"                                         has_secret dispatch_old_workflow -- "$URL"
+run dispatch-old-workflow-fork-of-fork 1 "too old to review a pull request from a fork of a fork" has_secret dispatch_old_workflow fork_of_fork -- "$URL"
+run dispatch-no-trigger 1 "is out of date, so gh bouncer can't start it"      has_secret dispatch_no_trigger -- "$URL"
 NOT="/bouncer check" run no-watch 0 "within about 10 minutes of the review finishing" has_secret -- --no-watch "$URL"
+run follow-push-run     0 "already running in your fork. Following it"        has_secret run_push_running -- "$URL"
+run follow-manual-run   0 "Following it instead of starting another"          has_secret run_dispatch_running -- "$URL"
+run other-pr-run        0 "Started the review"                                has_secret run_other_pr_running -- "$URL"
+run reuse-signed-run    0 "Your fork already reviewed this commit"            has_secret run_push_signed -- "$URL"
+run skipped-push-run    0 "Started the review"                                has_secret run_push_skipped -- "$URL"
+run followed-run-skipped 0 "That run didn't review your pull request"         has_secret run_push_running followed_run_skips -- "$URL"
+S_STATE="$(st pending '"note":"config_changed"')" run config-changed-rerun 0 "doesn't count: the maintainers changed the bouncer settings" has_secret run_push_signed -- "$URL"
 S_STATE="$(st pending '"note":"outdated"')" run outdated-syncs 0 "Your fork's bouncer workflow is out of date. Syncing" has_secret -- "$URL"
+ctrl_c ctrl-c-watching "run watch" "Stopped watching. The review is still running: https://github.com/fork/repo/actions/runs/4242" has_secret slow_watch -- "$URL"
 
 # --- when the review run fails: say why, and that nothing was used up
-run run-fails           1 "--log-failed"                                      has_secret run_fails -- "$URL"
+run run-out-of-credits  1 "The review didn't finish: Your Anthropic account is out of credits." has_secret run_fails -- "$URL"
+NOT="Process completed" run run-fails-no-annotation 1 "The review didn't finish" has_secret run_fails no_annotation -- "$URL"
+run run-cancelled       1 "cancelled before it was signed"                    has_secret run_cancelled -- "$URL"
+run run-fails-after-signing 0 "$DONE"                                       has_secret run_fails_after_signing -- "$URL"
+run run-view-fails      1 "Couldn't connect to GitHub."                       has_secret run_view_fails -- "$URL"
 
 # --- the result, from the bouncer's state once it has checked the signed review
 
