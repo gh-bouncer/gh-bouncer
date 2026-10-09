@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Stub gh for tests. Behavior is controlled by files in $STUB.
+printf '%s\n' "$*" >> "$STUB/calls.log"
+flag() { [ -f "$STUB/$1" ]; }
+case "$*" in
+  "pr view"*) flag no_branch_pr && exit 1; echo "https://github.com/up/repo/pull/7" ;;
+  "repo view"*) echo "up/repo" ;;
+  "api repos/up/repo/pulls/7 "*)
+    state=open; flag pr_closed && state=closed
+    head="fork/repo"; flag pr_from_upstream && head="up/repo"
+    printf '%s\t%s\t%s\t%s\n' "$state" "$head" "${HEAD_REF:-feature}" "https://github.com/up/repo/pull/7" ;;
+  "api repos/fork/repo --jq"*) printf 'true\tmain\n' ;;
+  "api -X GET repos/fork/repo/contents/"*) flag no_workflow && ! flag synced && exit 1; echo ".github/workflows/bouncer-review.yml" ;;
+  "api -X POST repos/fork/repo/merge-upstream"*) touch "$STUB/synced"; echo '{}' ;;
+  "api repos/fork/repo/actions/workflows/bouncer-review.yml --jq .state")
+    if flag wf_disabled && ! flag wf_enabled; then echo disabled_fork; else echo active; fi ;;
+  "api -X PUT repos/fork/repo/actions/permissions"*) ;;
+  "api -X PUT repos/fork/repo/actions/workflows/bouncer-review.yml/enable") flag wf_cannot_enable || touch "$STUB/wf_enabled" ;;
+  "secret list"*) if flag has_secret; then echo 1; else echo 0; fi ;;
+  "secret set ANTHROPIC_API_KEY -R fork/repo") cat > "$STUB/secret_value" ;;
+  "run list"*) if flag dispatched; then echo 555; else echo 100; fi ;;
+  "api -X POST repos/fork/repo/actions/workflows/bouncer-review.yml/dispatches"*)
+    touch "$STUB/dispatched"; flag dispatch_204 || echo '{"workflow_run_id": 4242, "run_url": "x", "html_url": "y"}' ;;
+  "run watch"*) flag run_fails && exit 1; echo "run ok" ;;
+  "pr comment 7 -R up/repo --body /bouncer check") ;;
+  *) echo "stub gh: unexpected: $*" >&2; exit 99 ;;
+esac

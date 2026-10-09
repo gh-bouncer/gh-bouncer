@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# gh bouncer: run the bouncer review for your pull request, in your fork, on your own API key.
+# https://github.com/pr-bouncer/bouncer
+set -euo pipefail
+
+VERSION="0.1.0"
+WORKFLOW="bouncer-review.yml"
+WORKFLOW_PATH=".github/workflows/$WORKFLOW"
+POLL_SECONDS="${GH_BOUNCER_POLL_SECONDS:-3}"
+
+usage() {
+  cat <<'EOF'
+Usage: gh bouncer [<pr-url> | <owner/repo#number> | <number>] [flags]
+
+Runs the bouncer review for your pull request in your fork, on your own
+Anthropic API key, and tells the project's gate when it's done.
+
+With no argument, uses the pull request for the current branch.
+
+Flags:
+  -R, --repo OWNER/REPO   Upstream repository, when giving just a number
+      --set-key           Replace the ANTHROPIC_API_KEY secret in your fork
+      --no-watch          Start the review and exit without waiting for it
+  -h, --help              Show this help
+  -v, --version           Show the version
+
+Environment:
+  ANTHROPIC_API_KEY       Stored as your fork's secret if it has none yet
+EOF
+}
+
+die() { printf 'gh bouncer: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*" >&2; }
+
+ARG=""
+UPSTREAM=""
+SET_KEY=0
+WATCH=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -v|--version) echo "gh-bouncer $VERSION"; exit 0 ;;
+    -R|--repo) [ $# -ge 2 ] || die "$1 needs OWNER/REPO"; UPSTREAM="$2"; shift 2 ;;
+    --repo=*) UPSTREAM="${1#--repo=}"; shift ;;
+    --set-key) SET_KEY=1; shift ;;
+    --no-watch) WATCH=0; shift ;;
+    -*) die "unknown flag: $1 (see gh bouncer --help)" ;;
+    *) [ -z "$ARG" ] || die "only one pull request at a time"; ARG="$1"; shift ;;
+  esac
+done
+
+# --- which pull request -------------------------------------------------------
+parse_url() {
+  # https://github.com/OWNER/REPO/pull/N[/...][?...][#...]
+  local rest="${1#*://}"
+  rest="${rest%%\?*}"
+  rest="${rest%%#*}"
+  local host owner repo kind num
+  IFS=/ read -r host owner repo kind num _ <<<"$rest"
+  [ "$kind" = "pull" ] && [ -n "$num" ] || die "not a pull request URL: $1"
+  [ "$host" = "github.com" ] || die "only github.com pull requests are supported"
+  UPSTREAM="$owner/$repo"
+  NUMBER="$num"
+}
+
+NUMBER=""
+if [ -z "$ARG" ]; then
+  url="$(gh pr view --json url --jq .url 2>/dev/null)" ||
+    die "no pull request found for the current branch. Pass its URL: gh bouncer https://github.com/OWNER/REPO/pull/123"
+  parse_url "$url"
+else
+  case "$ARG" in
+    http://*|https://*) parse_url "$ARG" ;;
+    */*\#*) UPSTREAM="${ARG%%\#*}"; NUMBER="${ARG#*\#}" ;;
+    \#*) NUMBER="${ARG#\#}" ;;
+    *) NUMBER="$ARG" ;;
+  esac
+fi
+case "$NUMBER" in ''|*[!0-9]*) die "'$NUMBER' is not a pull request number" ;; esac
+if [ -z "$UPSTREAM" ]; then
+  UPSTREAM="$(gh repo view --json nameWithOwner,parent \
+    --jq 'if .parent then "\(.parent.owner.login)/\(.parent.name)" else .nameWithOwner end' 2>/dev/null)" ||
+    die "can't tell which repository #$NUMBER is in. Pass the pull request URL instead."
+fi
+
+IFS=$'\t' read -r STATE HEAD_REPO HEAD_REF PR_URL < <(
+  gh api "repos/$UPSTREAM/pulls/$NUMBER" \
+    --jq '[.state, (.head.repo.full_name // "-"), .head.ref, .html_url] | @tsv' 2>/dev/null
+) || die "pull request $UPSTREAM#$NUMBER was not found"
+
+[ "$STATE" = "open" ] || die "$UPSTREAM#$NUMBER is $STATE. Reopen it first, then run gh bouncer again."
+[ "$HEAD_REPO" != "-" ] || die "the fork behind $UPSTREAM#$NUMBER was deleted"
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+[ "$(lower "$HEAD_REPO")" != "$(lower "$UPSTREAM")" ] ||
+  die "$UPSTREAM#$NUMBER comes from a branch in $UPSTREAM itself. Bouncer reviews pull requests from forks."
+
+IFS=$'\t' read -r IS_ADMIN DEFAULT_BRANCH < <(
+  gh api "repos/$HEAD_REPO" --jq '[(.permissions.admin // false), .default_branch] | @tsv'
+)
+[ "$IS_ADMIN" = "true" ] || die "you need admin rights on $HEAD_REPO (the fork) to run its review"
+
+say "Reviewing $PR_URL from $HEAD_REPO"
+
+# --- the review workflow must exist on the fork's default branch -----------------
+has_workflow() {
+  gh api -X GET "repos/$HEAD_REPO/contents/$WORKFLOW_PATH" -f ref="$DEFAULT_BRANCH" --jq .path >/dev/null 2>&1
+}
+if ! has_workflow; then
+  if [ "$HEAD_REF" = "$DEFAULT_BRANCH" ]; then
+    die "$HEAD_REPO's $DEFAULT_BRANCH branch doesn't have $WORKFLOW_PATH, and it's also your pull request's branch, so it won't be changed automatically. Merge the latest $UPSTREAM into it and push, then run gh bouncer again."
+  fi
+  say "Syncing $HEAD_REPO's $DEFAULT_BRANCH branch with $UPSTREAM to get the review workflow..."
+  gh api -X POST "repos/$HEAD_REPO/merge-upstream" -f branch="$DEFAULT_BRANCH" >/dev/null 2>&1 ||
+    die "couldn't sync $DEFAULT_BRANCH with $UPSTREAM. Use 'Sync fork' on https://github.com/$HEAD_REPO, then run gh bouncer again."
+  has_workflow || die "$UPSTREAM doesn't have $WORKFLOW_PATH on its default branch. Is bouncer installed there?"
+fi
+
+# --- workflows in forks start switched off ----------------------------------------
+workflow_state() { gh api "repos/$HEAD_REPO/actions/workflows/$WORKFLOW" --jq .state 2>/dev/null || echo missing; }
+if [ "$(workflow_state)" != "active" ]; then
+  gh api -X PUT "repos/$HEAD_REPO/actions/permissions" -F enabled=true -f allowed_actions=all >/dev/null 2>&1 || true
+  gh api -X PUT "repos/$HEAD_REPO/actions/workflows/$WORKFLOW/enable" >/dev/null 2>&1 || true
+  if [ "$(workflow_state)" != "active" ]; then
+    die "GitHub needs you to switch on workflows in your fork once. Open https://github.com/$HEAD_REPO/actions, click the button to enable them, then run gh bouncer again."
+  fi
+  say "Turned on the review workflow in $HEAD_REPO."
+fi
+
+# --- the key lives only in the fork's secrets -------------------------------------------
+has_key="$(gh secret list -R "$HEAD_REPO" --json name --jq 'map(select(.name == "ANTHROPIC_API_KEY")) | length' 2>/dev/null || echo 0)"
+if [ "$has_key" = "0" ] || [ "$SET_KEY" = "1" ]; then
+  key="${ANTHROPIC_API_KEY:-}"
+  if [ -z "$key" ]; then
+    [ -t 0 ] || die "no ANTHROPIC_API_KEY secret in $HEAD_REPO. Set ANTHROPIC_API_KEY in your environment, or run this in a terminal to be asked for it."
+    printf 'Anthropic API key (stored only as a secret in %s): ' "$HEAD_REPO" >&2
+    IFS= read -rs key
+    printf '\n' >&2
+  fi
+  [ -n "$key" ] || die "no key given"
+  case "$key" in sk-ant-*) ;; *) say "That doesn't look like an Anthropic API key (they start with sk-ant-); storing it anyway." ;; esac
+  printf '%s' "$key" | gh secret set ANTHROPIC_API_KEY -R "$HEAD_REPO" >/dev/null
+  unset key
+  say "Stored ANTHROPIC_API_KEY as a secret in $HEAD_REPO. After this, pushes to your pull request are reviewed automatically."
+fi
+
+# --- start the review ----------------------------------------------------------------
+latest_run() {
+  gh run list -R "$HEAD_REPO" -w "$WORKFLOW" -e workflow_dispatch -L 20 --json databaseId \
+    --jq 'map(.databaseId) | max // 0' 2>/dev/null || echo 0
+}
+before="$(latest_run)"
+resp="$(gh api -X POST "repos/$HEAD_REPO/actions/workflows/$WORKFLOW/dispatches" \
+  -f ref="$DEFAULT_BRANCH" -f "inputs[pr]=$NUMBER" -F return_run_details=true 2>&1)" ||
+  die "couldn't start the review: $resp"
+
+run_id="$(printf '%s' "$resp" | sed -n 's/.*"workflow_run_id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
+if [ -z "$run_id" ]; then
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep "$POLL_SECONDS"
+    now="$(latest_run)"
+    if [ "$now" != "0" ] && [ "$now" -gt "$before" ]; then run_id="$now"; break; fi
+  done
+fi
+[ -n "$run_id" ] || die "the review started but its run didn't show up. See https://github.com/$HEAD_REPO/actions/workflows/$WORKFLOW"
+
+RUN_URL="https://github.com/$HEAD_REPO/actions/runs/$run_id"
+say "Review running: $RUN_URL"
+if [ "$WATCH" = "0" ]; then
+  say "When it finishes, the gate picks it up within 10 minutes (or comment /bouncer check on $PR_URL)."
+  exit 0
+fi
+
+if ! gh run watch "$run_id" -R "$HEAD_REPO" --exit-status --interval 10 >&2; then
+  die "the review run failed. See why with: gh run view $run_id -R $HEAD_REPO --log-failed"
+fi
+
+gh pr comment "$NUMBER" -R "$UPSTREAM" --body "/bouncer check" >/dev/null ||
+  die "the review finished, but posting /bouncer check failed. The gate will still pick it up within 10 minutes."
+say "Done. The gate is checking your signed review now: $PR_URL"
