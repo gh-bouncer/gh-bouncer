@@ -67,9 +67,13 @@ check() {  # extra assertions per test
     set-key-env) [ "$(cat "$STUB/secret_value")" = "sk-ant-new" ] ;;
     enable) [ -f "$STUB/wf_enabled" ] ;;
     sync) [ -f "$STUB/synced" ] && has "$DONE" ;;
+    sync-lag) [ -f "$STUB/synced" ] ;;
     fork-of-fork-no-workflow|sync-own-branch) ! called 'merge-upstream' ;;
     dispatch-204) called '^run watch 555 ' ;;
     no-watch) ! called '^run watch' && ! called '^pr comment' ;;
+    branch-no-workflow) called 'contents/.github/workflows/bouncer.yml -f ref=feature' &&
+                        has "run gh bouncer again after each push" ;;
+    outdated-syncs) called 'merge-upstream' && [ "$(dispatches)" = 1 ] ;;
     closed-bounced) has "Don't force-push" && has "  • \`correct\`" && [ "$(dispatches)" = 0 ] ;;
     merged|closed*|already-passed|skip-label|not-waiting|override|open-*|fail-label-stale|from-upstream|fork-deleted)
       [ "$(dispatches)" = 0 ] && ! called 'secret' ;;
@@ -142,11 +146,18 @@ run fork-deleted        1 "The fork behind up/repo#7 was deleted"             fo
 run not-fork-owner      1 "You need admin rights on fork/repo"                fork_not_admin -- "$URL"
 
 # --- setting up the fork
-run enable              0 "Turned on the review workflow in fork/repo"        has_secret wf_disabled -- "$URL"
+run enable              0 "Turned on GitHub Actions in fork/repo"             has_secret wf_disabled -- "$URL"
 run cannot-enable       1 "https://github.com/fork/repo/actions"              has_secret wf_disabled wf_cannot_enable -- "$URL"
 run sync                0 "Synced fork/repo:main with up/repo"                has_secret no_workflow -- "$URL"
+NOT="turn on Actions" run sync-lag 0 "$DONE"                                has_secret no_workflow sync_lag -- "$URL"
+run sync-lag-forever    1 "GitHub hasn't picked up the bouncer workflow"      has_secret no_workflow sync_lag_forever -- "$URL"
+run sync-no-scope       1 "gh auth refresh -s workflow"                       has_secret no_workflow sync_no_scope -- "$URL"
+run sync-conflict       1 "commits that conflict with up/repo"                has_secret no_workflow sync_conflict -- "$URL"
 HEAD_REF=main run sync-own-branch 1 "it's your pull request's branch"         has_secret no_workflow -- "$URL"
 run upstream-no-workflow 1 "up/repo has no .github/workflows/bouncer.yml"     has_secret no_workflow upstream_no_workflow -- "$URL"
+run fork-of-fork        0 "$DONE"                                           has_secret fork_of_fork -- "$URL"
+run fork-of-fork-no-workflow 1 "fork/repo is a fork of mid/repo, not of up/repo" has_secret fork_of_fork no_workflow -- "$URL"
+NOT="reviewed automatically, on your key" run branch-no-workflow 0 "new commits aren't reviewed automatically" has_secret branch_no_workflow -- "$URL"
 
 # --- the key
 KEY=sk-ant-test run key-from-env 0 "Saved ANTHROPIC_API_KEY as an Actions secret in fork/repo" -- "$URL"
@@ -156,6 +167,7 @@ KEY=sk-ant-new run set-key-env 0 "Saved ANTHROPIC_API_KEY"                     h
 # --- starting the review, or following one: never pay twice for a commit
 run dispatch-204        0 "$DONE"                                           has_secret dispatch_204 -- "$URL"
 NOT="/bouncer check" run no-watch 0 "within about 10 minutes of the review finishing" has_secret -- --no-watch "$URL"
+S_STATE="$(st pending '"note":"outdated"')" run outdated-syncs 0 "Your fork's bouncer workflow is out of date. Syncing" has_secret -- "$URL"
 
 # --- when the review run fails: say why, and that nothing was used up
 run run-fails           1 "--log-failed"                                      has_secret run_fails -- "$URL"

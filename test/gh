@@ -98,15 +98,24 @@ case "$*" in
   "api repos/fork/repo --jq"*)
     flag head_api_fails && fail "gh: Bad Gateway (HTTP 502)"
     admin=true; flag fork_not_admin && admin=false
-    parent=up/repo
+    parent=up/repo; flag fork_of_fork && parent=mid/repo
     jq -n --arg db "$DB" --argjson admin "$admin" --arg parent "$parent" \
       '{fork: true, default_branch: $db, permissions: {admin: $admin, push: true}, parent: {full_name: $parent}}' | out ;;
   "api -X GET repos/fork/repo/contents/.github/workflows/bouncer.yml -f ref=$DB "*)
     if flag no_workflow && { ! flag synced || flag upstream_no_workflow; }; then not_found; fi
     echo '{"path":".github/workflows/bouncer.yml"}' | out ;;
+  "api -X GET repos/fork/repo/contents/.github/workflows/bouncer.yml -f ref=$HR "*)
+    flag branch_no_workflow && not_found; echo '{"path":".github/workflows/bouncer.yml"}' | out ;;
   "api -X POST repos/fork/repo/merge-upstream -f branch=$DB")
+    flag sync_no_scope && fail "gh: refusing to allow an OAuth App to create or update workflow \`.github/workflows/bouncer.yml\` without \`workflow\` scope (HTTP 422)"
+    flag sync_conflict && fail "gh: There are merge conflicts (HTTP 409)"
     touch "$STUB/synced"; echo '{"message":"Successfully fetched and fast-forwarded from upstream up:main.","merge_type":"fast-forward","base_branch":"up:main"}' ;;
   "api repos/fork/repo/actions/workflows/bouncer.yml --jq .state")
+    if flag synced && { flag sync_lag || flag sync_lag_forever; }; then
+      # GitHub takes a few seconds to register a workflow file that just arrived by syncing.
+      n="$(cat "$STUB/lag" 2>/dev/null || echo 0)"; echo $((n + 1)) >"$STUB/lag"
+      { [ "$n" -ge 3 ] && ! flag sync_lag_forever; } || not_found
+    fi
     st=active; flag wf_disabled && ! flag wf_enabled && st=disabled_fork
     echo '{"state":"'$st'"}' | out ;;
   "api -X PUT repos/fork/repo/actions/permissions"*) ;;

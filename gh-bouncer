@@ -508,11 +508,14 @@ NOTE=""   # why the last signed review of this commit didn't count, if the bounc
 [ -z "$STATE_NOW" ] || NOTE="$B_NOTE"
 
 # --- your fork -------------------------------------------------------------------------
-fork="$(api "repos/$HEAD_REPO" --jq '[(.permissions.admin // false), .default_branch] | @tsv')" ||
+fork="$(api "repos/$HEAD_REPO" --jq '[(.permissions.admin // false), .default_branch, (.parent.full_name // "")]
+  | map(tostring | if . == "" then "-" else . end) | join("\t")')" ||
   gh_failed $? "You can't see $HEAD_REPO, the fork $REF was opened from." "Only the pull request's author can run its review."
-IFS=$'\t' read -r IS_ADMIN DEFAULT_BRANCH <<<"$fork"
+IFS=$'\t' read -r IS_ADMIN DEFAULT_BRANCH FORK_PARENT <<<"$fork"
+[ "$FORK_PARENT" != "-" ] || FORK_PARENT=""
 [ "$IS_ADMIN" = "true" ] ||
   die "You need admin rights on $HEAD_REPO, the fork $REF was opened from." "Only the pull request's author can run its review."
+direct_fork() { [ "$(lower "$FORK_PARENT")" = "$(lower "$UPSTREAM")" ]; }
 
 say "Reviewing $REF from $HEAD_REPO"
 if [ -n "$STATE_NOW" ] && [ "$B_STATUS" = "pending" ] && [ -n "$B_DEADLINE" ]; then
@@ -523,36 +526,83 @@ case "$NOTE" in
   verify_error) warn "The bouncer couldn't verify the signed review of this commit." ;;
 esac
 
-# --- the review workflow must exist on the fork's default branch -----------------
+# has_workflow <branch>: does the fork have the bouncer workflow on that branch?
 has_workflow() {
-  api -X GET "repos/$HEAD_REPO/contents/$WORKFLOW_PATH" -f ref="$DEFAULT_BRANCH" --jq .path >/dev/null
+  local rc=0
+  api -X GET "repos/$HEAD_REPO/contents/$WORKFLOW_PATH" -f ref="$1" --jq .path >/dev/null || rc=$?
+  [ "$rc" != 0 ] || return 0
+  is_404 && return 1
+  gh_failed "$rc"
 }
-if ! has_workflow; then
+# sync_fork <why it's needed>: bring the project's default branch into the fork's, like Sync fork
+sync_fork() {
   if [ "$HEAD_REF" = "$DEFAULT_BRANCH" ]; then
-    die "Your fork doesn't have the bouncer workflow yet, and gh bouncer won't change $DEFAULT_BRANCH because it's your pull request's branch." \
+    die "$1, and gh bouncer won't change $DEFAULT_BRANCH because it's your pull request's branch." \
       "Merge the latest $UPSTREAM into $HEAD_REPO:$DEFAULT_BRANCH and push, then run gh bouncer again."
   fi
-  say "Your fork doesn't have the bouncer workflow yet. Syncing $HEAD_REPO:$DEFAULT_BRANCH with $UPSTREAM..."
-  api -X POST "repos/$HEAD_REPO/merge-upstream" -f branch="$DEFAULT_BRANCH" >/dev/null || {
-    reachable $?
+  if ! direct_fork; then
+    die "$1, and gh bouncer can't sync it: $HEAD_REPO is a fork of ${FORK_PARENT:-another repository}, not of $UPSTREAM." \
+      "Merge $UPSTREAM's default branch into $HEAD_REPO:$DEFAULT_BRANCH and push, then run gh bouncer again."
+  fi
+  say "$1. Syncing $HEAD_REPO:$DEFAULT_BRANCH with $UPSTREAM..."
+  local rc=0
+  api -X POST "repos/$HEAD_REPO/merge-upstream" -f branch="$DEFAULT_BRANCH" >/dev/null || rc=$?
+  if [ "$rc" != 0 ]; then
+    reachable "$rc"
+    if grep -q 'workflow.*scope' "$ERRF"; then
+      die "Syncing your fork adds a workflow file, which needs the workflow scope on your gh login." \
+        "Run gh auth refresh -s workflow, then gh bouncer again."
+    elif grep -q 'HTTP 409' "$ERRF"; then
+      die "Couldn't sync $HEAD_REPO:$DEFAULT_BRANCH: it has commits that conflict with $UPSTREAM." \
+        "Merge $UPSTREAM into it and push, or use Sync fork on https://github.com/$HEAD_REPO, then run gh bouncer again."
+    fi
     die "Couldn't sync $HEAD_REPO:$DEFAULT_BRANCH with $UPSTREAM: $(gh_msg)" \
       "Use Sync fork on https://github.com/$HEAD_REPO, then run gh bouncer again."
-  }
-  has_workflow || die "$UPSTREAM has no $WORKFLOW_PATH on its default branch, so there's no review to run." \
-    "Bouncer may have been removed from the project. Ask its maintainers."
-  ok "Synced $HEAD_REPO:$DEFAULT_BRANCH with $UPSTREAM"
-fi
+  fi
+  ok "Synced $HEAD_REPO:$DEFAULT_BRANCH with $UPSTREAM (your pull request's branch wasn't touched)"
+}
 
-# --- workflows in forks start switched off ----------------------------------------
-workflow_state() { api "repos/$HEAD_REPO/actions/workflows/$WORKFLOW" --jq .state || echo missing; }
-if [ "$(workflow_state)" != "active" ]; then
+# Manual reviews run the workflow from the fork's default branch.
+if ! has_workflow "$DEFAULT_BRANCH"; then
+  sync_fork "Your fork doesn't have the bouncer workflow yet"
+  has_workflow "$DEFAULT_BRANCH" || die "$UPSTREAM has no $WORKFLOW_PATH on its default branch, so there's no review to run." \
+    "Bouncer may have been removed from the project. Ask its maintainers."
+elif [ "$NOTE" = "outdated" ]; then
+  sync_fork "Your fork's bouncer workflow is out of date"
+fi
+# Reviews on push run the workflow from the pushed branch, so they need it there too.
+AUTO=""
+if [ "$HEAD_REF" = "$DEFAULT_BRANCH" ] || has_workflow "$HEAD_REF"; then AUTO=1; fi
+
+# --- workflows in forks start switched off -------------------------------------------------
+read_workflow_state() {  # WF_STATE: active, disabled_..., or missing
+  local rc=0
+  WF_STATE="$(api "repos/$HEAD_REPO/actions/workflows/$WORKFLOW" --jq .state)" || rc=$?
+  [ "$rc" != 0 ] || return 0
+  is_404 && { WF_STATE="missing"; return 0; }
+  gh_failed "$rc"
+}
+read_workflow_state
+if [ "$WF_STATE" = "missing" ]; then
+  # GitHub takes a few seconds to register a workflow file that just arrived.
+  gray "Waiting for GitHub to pick up the workflow..."
+  i=0
+  while [ "$WF_STATE" = "missing" ] && [ "$i" -lt 10 ]; do
+    sleep "$POLL_SECONDS"
+    read_workflow_state
+    i=$((i + 1))
+  done
+  [ "$WF_STATE" != "missing" ] || die "GitHub hasn't picked up the bouncer workflow in $HEAD_REPO yet." \
+    "Wait a minute, then run gh bouncer again. If it keeps happening, check https://github.com/$HEAD_REPO/actions"
+fi
+if [ "$WF_STATE" != "active" ]; then
   gh api -X PUT "repos/$HEAD_REPO/actions/permissions" -F enabled=true -f allowed_actions=all >/dev/null 2>&1 || true
   gh api -X PUT "repos/$HEAD_REPO/actions/workflows/$WORKFLOW/enable" >/dev/null 2>&1 || true
-  if [ "$(workflow_state)" != "active" ]; then
-    die "GitHub needs you to turn on workflows in your fork once, in the browser." \
-      "Open https://github.com/$HEAD_REPO/actions, click the button to enable them, then run gh bouncer again."
-  fi
-  ok "Turned on the review workflow in $HEAD_REPO"
+  read_workflow_state
+  [ "$WF_STATE" = "active" ] || die "GitHub needs you to turn on Actions in your fork once, in the browser." \
+    "Open https://github.com/$HEAD_REPO/actions, click \"I understand my workflows, go ahead and enable them\", then run gh bouncer again."
+  ok "Turned on GitHub Actions in $HEAD_REPO"
+  gray "Forks start with Actions off. The review runs there, in your fork."
 fi
 
 # --- the key lives only in the fork's secrets -------------------------------------------
@@ -573,7 +623,6 @@ if [ "$has_key" = "0" ] || [ "$SET_KEY" = "1" ]; then
   unset key
   [ "$rc" = 0 ] || { reachable "$rc"; die "Couldn't save the key in $HEAD_REPO: $(gh_msg)"; }
   ok "Saved ANTHROPIC_API_KEY as an Actions secret in $HEAD_REPO"
-  gray "After this, pushes to your pull request are reviewed automatically."
 fi
 
 # --- start the review ----------------------------------------------------------------
@@ -613,3 +662,13 @@ ghc pr comment "$NUMBER" -R "$UPSTREAM" --body "/bouncer check" >/dev/null ||
   warn "Couldn't ask the bouncer to check right away. It checks every 10 minutes on its own."
 ok "Review finished. The bouncer is checking the signed review now."
 gray "The result will appear on $PR_URL"
+
+auto_note() {
+  if [ -n "$AUTO" ]; then
+    gray "New commits you push to this pull request are reviewed automatically, on your key."
+  else
+    gray "Your branch $HEAD_REF doesn't have the bouncer workflow, so new commits aren't reviewed automatically."
+    gray "Merge the latest $UPSTREAM into it to change that, or run gh bouncer again after each push."
+  fi
+}
+auto_note
