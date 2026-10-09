@@ -65,6 +65,7 @@ check() {  # extra assertions per test
     key-from-env|key-trimmed) [ "$(cat "$STUB/secret_value")" = "sk-ant-test" ] && ! called 'sk-ant' ;;
     key-not-a-key|no-key-no-tty|set-key-no-tty) [ ! -f "$STUB/secret_value" ] && [ "$(dispatches)" = 0 ] ;;
     set-key-env) [ "$(cat "$STUB/secret_value")" = "sk-ant-new" ] ;;
+    secret-list-fails) ! called '^secret set' && has "$DONE" ;;
     enable) [ -f "$STUB/wf_enabled" ] ;;
     sync) [ -f "$STUB/synced" ] && has "$DONE" ;;
     sync-lag) [ -f "$STUB/synced" ] ;;
@@ -161,8 +162,12 @@ NOT="reviewed automatically, on your key" run branch-no-workflow 0 "new commits 
 
 # --- the key
 KEY=sk-ant-test run key-from-env 0 "Saved ANTHROPIC_API_KEY as an Actions secret in fork/repo" -- "$URL"
+KEY="  sk-ant-test " run key-trimmed 0 "Saved ANTHROPIC_API_KEY"               -- "$URL"
+KEY=hunter2 run key-not-a-key 1 "doesn't look like an Anthropic API key (they start with sk-ant-), so it wasn't saved" -- "$URL"
 run no-key-no-tty       1 "Your fork has no ANTHROPIC_API_KEY secret yet."    -- "$URL"
+run set-key-no-tty      1 "--set-key needs a terminal"                        has_secret -- --set-key "$URL"
 KEY=sk-ant-new run set-key-env 0 "Saved ANTHROPIC_API_KEY"                     has_secret -- --set-key "$URL"
+run secret-list-fails   0 "Couldn't check your fork's secrets"                has_secret secret_list_fails -- "$URL"
 
 # --- starting the review, or following one: never pay twice for a commit
 run dispatch-204        0 "$DONE"                                           has_secret dispatch_204 -- "$URL"

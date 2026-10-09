@@ -6,6 +6,7 @@
 #   S_LABELS   the pull request's labels, comma-separated (default: bouncer:pending)
 #   HEAD_REF, DEFAULT_BRANCH
 printf '%s\n' "$*" >>"$STUB/calls.log"
+[ -z "${ANTHROPIC_API_KEY:-}" ] || echo "LEAK: ANTHROPIC_API_KEY in gh's environment" >>"$STUB/calls.log"
 flag() { [ -f "$STUB/$1" ]; }
 fail() { printf '%s\n' "$@" >&2; exit 1; }
 not_found() { fail "gh: Not Found (HTTP 404)"; }
@@ -121,6 +122,7 @@ case "$*" in
   "api -X PUT repos/fork/repo/actions/permissions"*) ;;
   "api -X PUT repos/fork/repo/actions/workflows/bouncer.yml/enable") flag wf_cannot_enable || touch "$STUB/wf_enabled" ;;
   "secret list -R fork/repo "*)
+    flag secret_list_fails && fail "failed to get secrets: HTTP 503: Service Unavailable"
     if flag has_secret; then echo '[{"name":"OTHER"},{"name":"ANTHROPIC_API_KEY"}]'; else echo '[{"name":"OTHER"}]'; fi | out ;;
   "secret set ANTHROPIC_API_KEY -R fork/repo") cat >"$STUB/secret_value" ;;
   "run list -R fork/repo -w bouncer.yml "*)

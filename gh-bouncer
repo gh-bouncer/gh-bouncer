@@ -10,7 +10,12 @@ ACTION_REPO="gh-bouncer/action"
 ACTION_REF="${GH_BOUNCER_ACTION_REF:-v1}"
 SETUP_BRANCH="bouncer-setup"
 SITE="https://gh-bouncer.com"
+KEYS_URL="https://console.anthropic.com/settings/keys"
 POLL_SECONDS="${GH_BOUNCER_POLL_SECONDS:-3}"        # waiting for a run or a workflow to show up
+
+# The key is read once and kept out of the environment of every command this script runs.
+ENV_KEY="${ANTHROPIC_API_KEY:-}"
+unset ANTHROPIC_API_KEY
 
 # --- output, the gh way ------------------------------------------------------------------
 # Messages go to stderr: ✓ green when done, X red when not, ! yellow for warnings, gray for
@@ -379,15 +384,15 @@ STATE_JQ='.[] | select(.user.login == "github-actions[bot]") | (.body // "")
   | select(contains("<!-- bouncer:state "))
   | (split("<!-- bouncer:state ")[1] | split(" -->")[0] | try fromjson catch null)
   | select(type == "object")
-  | [.status, .sha, .deadline, .left, .report, .note, .base,
+  | [.status, .sha, .deadline, .left, .report, .model, .effort, .note, .base,
      (if (.reasons | type) == "array" then .reasons | map(tostring) | join("\u001f") else "" end)]
   | map(if . == null then "" else tostring end | gsub("[\\t\\r\\n]+"; " ") | if . == "" then "-" else . end)
   | join("\t")'
 load_state() {
   local line v
   line="$(api "repos/$UPSTREAM/issues/$NUMBER/comments?per_page=100" --paginate --jq "$STATE_JQ" | tail -n 1)" || return $?
-  IFS=$'\t' read -r B_STATUS B_SHA B_DEADLINE B_LEFT B_REPORT B_NOTE B_BASE B_REASONS <<<"$line"
-  for v in B_STATUS B_SHA B_DEADLINE B_LEFT B_REPORT B_NOTE B_BASE B_REASONS; do
+  IFS=$'\t' read -r B_STATUS B_SHA B_DEADLINE B_LEFT B_REPORT B_MODEL B_EFFORT B_NOTE B_BASE B_REASONS <<<"$line"
+  for v in B_STATUS B_SHA B_DEADLINE B_LEFT B_REPORT B_MODEL B_EFFORT B_NOTE B_BASE B_REASONS; do
     [ "${!v}" != "-" ] || printf -v "$v" '%s' ""
   done
 }
@@ -606,24 +611,55 @@ if [ "$WF_STATE" != "active" ]; then
 fi
 
 # --- the key lives only in the fork's secrets -------------------------------------------
-has_key="$(ghc secret list -R "$HEAD_REPO" --json name --jq 'map(select(.name == "ANTHROPIC_API_KEY")) | length' || echo 0)"
-if [ "$has_key" = "0" ] || [ "$SET_KEY" = "1" ]; then
-  key="${ANTHROPIC_API_KEY:-}"
+ask_key() {
+  local key="$ENV_KEY" from_env=1
   if [ -z "$key" ]; then
-    [ -t 0 ] || die "Your fork has no ANTHROPIC_API_KEY secret yet." \
-      "Set ANTHROPIC_API_KEY in your environment, or run gh bouncer in a terminal to be asked for it."
-    printf 'Anthropic API key (stored only as a secret in %s): ' "$HEAD_REPO" >&2
+    from_env=""
+    if [ ! -t 0 ]; then
+      [ "$SET_KEY" = 0 ] || die "--set-key needs a terminal to ask for the key, or ANTHROPIC_API_KEY in your environment."
+      die "Your fork has no ANTHROPIC_API_KEY secret yet." \
+        "Set ANTHROPIC_API_KEY in your environment, or run gh bouncer in a terminal to be asked for it."
+    fi
+    say ""
+    say "The review runs on your own Anthropic API key, saved only as an Actions secret in $HEAD_REPO."
+    say "Every review is billed to your key${B_MODEL:+: this project reviews with $B_MODEL${B_EFFORT:+ at $B_EFFORT effort}}."
+    [ -z "$AUTO" ] || say "A new review also starts on its own each time you push to this pull request."
+    gray "Get a key at $KEYS_URL"
+    printf '%s?%s Anthropic API key %s(input hidden)%s ' "$C_OK" "$C_OFF" "$C_GRAY" "$C_OFF" >&2
     IFS= read -rs key || true
     printf '\n' >&2
   fi
-  [ -n "$key" ] || die "No key entered. Your fork's secrets weren't changed."
-  case "$key" in sk-ant-*) ;; *) warn "That doesn't look like an Anthropic API key (they start with sk-ant-). Saving it anyway." ;; esac
-  rc=0
+  # Trim what a paste can bring along.
+  key="${key#"${key%%[![:space:]]*}"}"
+  key="${key%"${key##*[![:space:]]}"}"
+  [ -n "$key" ] || die "No key entered. Your fork's secrets weren't changed." "Run gh bouncer again when you have a key."
+  local valid=""
+  case "$key" in *[[:space:]]*) ;; sk-ant-?*) valid=1 ;; esac
+  if [ -z "$valid" ]; then
+    [ -z "$from_env" ] || die "ANTHROPIC_API_KEY in your environment doesn't look like an Anthropic API key (they start with sk-ant-), so it wasn't saved." \
+      "Fix it or unset it, then run gh bouncer again."
+    die "That doesn't look like an Anthropic API key (they start with sk-ant-), so it wasn't saved." \
+      "Copy it again from $KEYS_URL and run gh bouncer again."
+  fi
+  local rc=0
   printf '%s' "$key" | ghc secret set ANTHROPIC_API_KEY -R "$HEAD_REPO" >/dev/null || rc=$?
-  unset key
+  key=""
   [ "$rc" = 0 ] || { reachable "$rc"; die "Couldn't save the key in $HEAD_REPO: $(gh_msg)"; }
   ok "Saved ANTHROPIC_API_KEY as an Actions secret in $HEAD_REPO"
+  gray "Only workflows in your fork can read it. Replace it any time with gh bouncer --set-key"
+  say ""
+}
+rc=0
+has_key="$(ghc secret list -R "$HEAD_REPO" --json name --jq 'map(select(.name == "ANTHROPIC_API_KEY")) | length')" || rc=$?
+if [ "$rc" != 0 ]; then
+  reachable "$rc"
+  if [ "$SET_KEY" = 0 ]; then
+    warn "Couldn't check your fork's secrets ($(gh_msg)). Going ahead as if ANTHROPIC_API_KEY is there."
+    gray "If it isn't, the review stops before using any tokens and says so."
+    has_key=1
+  fi
 fi
+if [ "$has_key" = "0" ] || [ "$SET_KEY" = 1 ]; then ask_key; fi
 
 # --- start the review ----------------------------------------------------------------
 latest_run() {
