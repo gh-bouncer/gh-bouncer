@@ -37,6 +37,7 @@ gray() { printf '  %s%s%s\n' "$C_GRAY" "$*" "$C_OFF" >&2; }
 hint() { local line; for line in "$@"; do [ -z "$line" ] || printf '  %s\n' "$line" >&2; done; }
 # die <what went wrong> [<what to do>...]
 die() { bad "$1"; shift; hint "$@"; exit 1; }
+plural() { if [ "$1" = 1 ]; then printf '%s %s' "$1" "$2"; else printf '%s %ss' "$1" "$2"; fi; }
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
 # --- talking to GitHub -------------------------------------------------------------------------
@@ -357,13 +358,154 @@ fi
 case "$UPSTREAM" in */?*) ;; *) die "'$UPSTREAM' isn't a repository. Use -R OWNER/REPO." ;; esac
 REF="$UPSTREAM#$NUMBER"
 
-info="$(api "repos/$UPSTREAM/pulls/$NUMBER" --jq '[.state, (.head.repo.full_name // "-"), .head.ref, .html_url] | @tsv')" ||
-  gh_failed $? "Pull request $REF doesn't exist, or you can't see it." "Check the URL and try again."
-IFS=$'\t' read -r STATE HEAD_REPO HEAD_REF PR_URL <<<"$info"
-[ "$STATE" = "open" ] || die "$REF is $STATE." "Reopen it, then run gh bouncer again."
-[ "$HEAD_REPO" != "-" ] || die "The fork behind $REF was deleted, so it can't be reviewed."
-[ "$(lower "$HEAD_REPO")" != "$(lower "$UPSTREAM")" ] ||
-  die "$REF comes from a branch in $UPSTREAM itself. Bouncer reviews pull requests from forks."
+# --- the pull request, and what the project's bouncer says about it ----------------
+# Empty fields become "-" so tab-separated values don't collapse when read back.
+PR_JQ='[.state, (.merged_at != null), (.head.repo.full_name // ""), .head.ref, .head.sha, .html_url,
+  ([.labels[].name] | join(","))] | map(tostring | if . == "" then "-" else . end) | join("\t")'
+load_pr() {
+  local info
+  info="$(api "repos/$UPSTREAM/pulls/$NUMBER" --jq "$PR_JQ")" || return $?
+  IFS=$'\t' read -r PR_STATE PR_MERGED HEAD_REPO HEAD_REF HEAD_SHA PR_URL LABELS <<<"$info"
+  [ "$HEAD_REPO" != "-" ] || HEAD_REPO=""
+  [ "$LABELS" != "-" ] || LABELS=""
+}
+has_label() { case ",$LABELS," in *",$1,"*) return 0 ;; esac; return 1; }
+
+# The bouncer keeps its state in a comment by github-actions[bot]:
+#   <!-- bouncer:state {"sha": ..., "status": ..., "left": ..., ...} -->
+# The last such comment counts; comments by anyone else are ignored, so they can't fake it.
+# Fields an older bouncer doesn't write come back empty.
+STATE_JQ='.[] | select(.user.login == "github-actions[bot]") | (.body // "")
+  | select(contains("<!-- bouncer:state "))
+  | (split("<!-- bouncer:state ")[1] | split(" -->")[0] | try fromjson catch null)
+  | select(type == "object")
+  | [.status, .sha, .deadline, .left, .report, .note, .base,
+     (if (.reasons | type) == "array" then .reasons | map(tostring) | join("\u001f") else "" end)]
+  | map(if . == null then "" else tostring end | gsub("[\\t\\r\\n]+"; " ") | if . == "" then "-" else . end)
+  | join("\t")'
+load_state() {
+  local line v
+  line="$(api "repos/$UPSTREAM/issues/$NUMBER/comments?per_page=100" --paginate --jq "$STATE_JQ" | tail -n 1)" || return $?
+  IFS=$'\t' read -r B_STATUS B_SHA B_DEADLINE B_LEFT B_REPORT B_NOTE B_BASE B_REASONS <<<"$line"
+  for v in B_STATUS B_SHA B_DEADLINE B_LEFT B_REPORT B_NOTE B_BASE B_REASONS; do
+    [ "${!v}" != "-" ] || printf -v "$v" '%s' ""
+  done
+}
+known_status() { case "$1" in pending|pass|fail|expired|exhausted|override|wrong_base) return 0 ;; esac; return 1; }
+fmt_time() { printf '%s' "$1" | sed 's/T\([0-9][0-9]:[0-9][0-9]\).*/ \1 UTC/'; }
+attempts_left() { [ -z "$B_LEFT" ] || printf ' (%s left)' "$(plural "$B_LEFT" "review attempt")"; }
+show_reasons() {
+  [ -n "$B_REASONS" ] || return 0
+  local r reasons
+  IFS=$'\x1f' read -r -a reasons <<<"$B_REASONS"
+  say ""
+  for r in "${reasons[@]}"; do [ -z "$r" ] || say "  • $r"; done
+}
+show_report() { [ -z "$B_REPORT" ] || { say ""; gray "Full review: $B_REPORT"; }; }
+no_attempts_left() { say "No review attempts left. A maintainer can still reopen it if they'd like to take a look."; }
+# How to try again after a bounce closed the pull request.
+retry_steps() {
+  [ "$B_LEFT" != 0 ] || { no_attempts_left; return 0; }
+  say "To try again$(attempts_left):"
+  if [ "$B_SHA" = "$HEAD_SHA" ]; then
+    say "  1. Push your fixes as new commits. Don't force-push: GitHub can't reopen a pull request"
+    say "     whose branch was force-pushed while it was closed."
+    say "  2. Reopen the pull request."
+    say "  3. Run gh bouncer $PR_URL"
+  else
+    say "  1. Reopen the pull request (you've already pushed new commits)."
+    say "  2. Run gh bouncer $PR_URL"
+  fi
+}
+wrong_base() {  # <is the pull request closed: yes|no>
+  local what="its base branch${B_BASE:+ ($B_BASE)} isn't one this project takes outside pull requests into."
+  if [ "$1" = yes ]; then
+    die "$REF was closed because $what" "Open a new pull request against the right branch. A closed pull request's base can't be changed."
+  fi
+  die "$REF was bounced: $what" "Change its base branch as the bouncer's comment on $PR_URL explains."
+}
+note_explained() {  # why a signed review of this commit doesn't count
+  case "$1" in
+    config_changed) printf '%s' "the maintainers changed the bouncer settings after it ran" ;;
+    outdated) printf '%s' "it was made with an outdated version of the bouncer review" ;;
+  esac
+}
+
+load_pr || gh_failed $? "Pull request $REF doesn't exist, or you can't see it." "Check the URL and try again."
+load_state || gh_failed $?
+STATE_NOW=""   # the bouncer's state is about the pull request's current commit
+if [ -n "$B_SHA" ] && [ "$B_SHA" = "$HEAD_SHA" ]; then STATE_NOW=1; fi
+
+# --- before spending anything: is there a review to run? ------------------------------
+if [ "$PR_MERGED" = "true" ]; then ok "$REF is already merged. Nothing to do."; exit 0; fi
+if [ "$PR_STATE" != "open" ]; then
+  case "$B_STATUS" in
+    fail)
+      bad "$REF was bounced and closed."
+      show_reasons
+      show_report
+      say ""
+      retry_steps
+      exit 1 ;;
+    exhausted) die "$REF used all its review attempts and was closed." "A maintainer can still reopen it if they'd like to take a look." ;;
+    expired)
+      [ "$B_LEFT" != 0 ] || die "$REF was closed: no review arrived before the deadline, and it has no review attempts left." \
+        "A maintainer can still reopen it if they'd like to take a look."
+      die "$REF was closed because no review arrived before the deadline." "Reopen it, then run gh bouncer $PR_URL" ;;
+    wrong_base) wrong_base yes ;;
+    *) die "$REF is closed." "Reopen it, then run gh bouncer again." ;;
+  esac
+fi
+[ -n "$HEAD_REPO" ] || die "The fork behind $REF was deleted, so it can't be reviewed."
+if [ "$(lower "$HEAD_REPO")" = "$(lower "$UPSTREAM")" ]; then
+  ok "$REF comes from a branch in $UPSTREAM, not a fork, so it doesn't need a bouncer review."
+  exit 0
+fi
+if has_label bouncer:skip; then
+  ok "A maintainer labeled $REF bouncer:skip, so it doesn't need a bouncer review."
+  exit 0
+fi
+if [ -n "$STATE_NOW" ]; then
+  case "$B_STATUS" in
+    pass)
+      ok "$REF already passed the bouncer review. Nothing to do."
+      [ -z "$B_REPORT" ] || gray "Review: $B_REPORT"
+      exit 0 ;;
+    override) ok "A maintainer set the bouncer's verdict aside for $REF. Nothing to do."; exit 0 ;;
+    fail)
+      bad "$REF was bounced. It stays open for a maintainer to confirm."
+      show_reasons
+      show_report
+      say ""
+      if [ "$B_LEFT" = 0 ]; then no_attempts_left; else say "To try again$(attempts_left): push your fixes as new commits, then run gh bouncer again."; fi
+      exit 1 ;;
+    exhausted) die "$REF has used all its review attempts." "A maintainer can still take a look if they'd like." ;;
+    wrong_base) wrong_base no ;;
+  esac
+fi
+if has_label bouncer:pass; then
+  ok "$REF already passed the bouncer review. Nothing to do."
+  if [ -n "$B_SHA" ] && [ -z "$STATE_NOW" ]; then
+    gray "That was for an earlier commit. If the bouncer asks for a new review of your latest one, run gh bouncer again."
+  fi
+  exit 0
+fi
+if has_label bouncer:fail; then
+  warn "The bouncer hasn't caught up with $REF's latest commit yet."
+  gray "Wait a minute, then run gh bouncer again."
+  exit 0
+fi
+if ! has_label bouncer:pending; then
+  warn "$REF isn't waiting for a bouncer review, so there's nothing to run."
+  gray "Its author may be exempt, or the bouncer hasn't seen it yet. If you just opened it, wait a minute and try again."
+  exit 0
+fi
+if [ -n "$B_STATUS" ] && ! known_status "$B_STATUS"; then
+  warn "The bouncer says \"$B_STATUS\" about $REF, which this version of gh bouncer doesn't know. Going ahead as if it's waiting for a review."
+  gray "Updating may help: gh extension upgrade bouncer"
+fi
+NOTE=""   # why the last signed review of this commit didn't count, if the bouncer said so
+[ -z "$STATE_NOW" ] || NOTE="$B_NOTE"
 
 # --- your fork -------------------------------------------------------------------------
 fork="$(api "repos/$HEAD_REPO" --jq '[(.permissions.admin // false), .default_branch] | @tsv')" ||
@@ -373,6 +515,13 @@ IFS=$'\t' read -r IS_ADMIN DEFAULT_BRANCH <<<"$fork"
   die "You need admin rights on $HEAD_REPO, the fork $REF was opened from." "Only the pull request's author can run its review."
 
 say "Reviewing $REF from $HEAD_REPO"
+if [ -n "$STATE_NOW" ] && [ "$B_STATUS" = "pending" ] && [ -n "$B_DEADLINE" ]; then
+  gray "Deadline $(fmt_time "$B_DEADLINE")${B_LEFT:+ · $(plural "$B_LEFT" "review attempt") left}"
+fi
+case "$NOTE" in
+  config_changed|outdated) warn "Your last review of this commit doesn't count: $(note_explained "$NOTE"). Running a new one doesn't use up a review attempt." ;;
+  verify_error) warn "The bouncer couldn't verify the signed review of this commit." ;;
+esac
 
 # --- the review workflow must exist on the fork's default branch -----------------
 has_workflow() {

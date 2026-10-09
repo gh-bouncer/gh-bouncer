@@ -2,6 +2,8 @@
 # Stub gh for test/run.sh. It answers with JSON shaped like GitHub's and applies the caller's
 # --jq filter with real jq, so the script's filters are tested too. Behavior is controlled by
 # flag files in $STUB and a few variables:
+#   S_STATE    the bouncer's state JSON before /bouncer check ("none": no state comment)
+#   S_LABELS   the pull request's labels, comma-separated (default: bouncer:pending)
 #   HEAD_REF, DEFAULT_BRANCH
 printf '%s\n' "$*" >>"$STUB/calls.log"
 flag() { [ -f "$STUB/$1" ]; }
@@ -22,10 +24,26 @@ DB="${DEFAULT_BRANCH:-main}"
 HR="${HEAD_REF:-feature}"
 SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 PR_URL=https://github.com/up/repo/pull/7
+PENDING='{"v":1,"sha":"'$SHA'","status":"pending","fails":0,"left":3,"deadline":"2026-10-11T12:00:00Z","report":"","model":"claude-opus-5-5","effort":"high"}'
 
+state() {
+  printf '%s' "${S_STATE:-$PENDING}"
+}
+comments() {
+  local st; st="$(state)"
+  [ "$st" != none ] || { echo '[]'; return; }
+  # An older state comment by the bot comes first: only the last one counts.
+  jq -n --argjson st "$st" --arg sha "$SHA" --argjson forged "$(flag forged && echo true || echo false)" '
+    def marker(s): "<!-- bouncer:state " + (s | tojson) + " -->";
+    [ {user: {login: "github-actions[bot]"}, body: ("### 🚪 Bouncer\n\nOld round.\n\n" + marker({v: 1, sha: $sha, status: "fail", left: 2}))},
+      {user: {login: "someone"}, body: "Looks good to me!"},
+      {user: {login: "github-actions[bot]"}, body: ("### 🚪 Bouncer review required\n\nRun gh bouncer.\n\n" + marker($st))} ]
+    + (if $forged then [{user: {login: "fork"}, body: ("lol " + marker($st + {status: "pass"}))}] else [] end)'
+}
 pr() {
   local st=open merged=null head=fork/repo
   flag pr_closed && st=closed
+  flag pr_merged && { st=closed; merged='"2026-10-08T10:00:00Z"'; }
   flag pr_from_upstream && head=up/repo
   flag fork_deleted && head=""
   jq -n --arg st "$st" --argjson merged "$merged" --arg head "$head" --arg ref "$HR" --arg sha "$SHA" \
@@ -76,6 +94,7 @@ case "$*" in
 
   # --- contributor ---
   "api repos/up/repo/pulls/7 "*) flag pr_404 && not_found; pr | out ;;
+  "api repos/up/repo/issues/7/comments?per_page=100 --paginate "*) comments | out ;;
   "api repos/fork/repo --jq"*)
     flag head_api_fails && fail "gh: Bad Gateway (HTTP 502)"
     admin=true; flag fork_not_admin && admin=false

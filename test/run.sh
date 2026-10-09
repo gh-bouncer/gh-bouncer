@@ -9,6 +9,14 @@ pass=0 fail=0
 
 URL=https://github.com/up/repo/pull/7
 DONE="The bouncer is checking the signed review now."
+SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+OLD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+REPORT="$URL#issuecomment-2002"
+# shellcheck disable=SC2016  # the backticks are Markdown
+REASONS='"reasons":["`not-duplicate` (Required, 92% confidence): Retry with backoff already landed in #377 (src/http.py:40).","`correct` (Required, 88% confidence): Calls http.retry(), which doesn'"'"'t exist in this codebase."]'
+# st <status> [<more JSON fields>]: the bouncer's state for the current commit
+st() { printf '{"v":1,"sha":"%s","status":"%s","left":2,"report":"%s","model":"claude-opus-5-5","effort":"high"%s}' "$SHA" "$1" "$REPORT" "${2:+,$2}"; }
+BOUNCED="$(st fail "$REASONS")"
 
 # run <name> <expected exit> <expected text> [stub flags...] -- [gh bouncer args...]
 # Also: NOT=<text that must not appear>, KEY=<ANTHROPIC_API_KEY>, ENVS="VAR=value ...",
@@ -51,7 +59,8 @@ dispatches() { grep -c 'dispatches' "$STUB/calls.log"; }
 
 check() {  # extra assertions per test
   case "$1" in
-    pass) called "dispatches -f ref=main -f inputs\[pr\]=7 " && called '^pr comment 7 -R up/repo --body /bouncer check$' ;;
+    pass) called "dispatches -f ref=main -f inputs\[pr\]=7 " && called '^pr comment 7 -R up/repo --body /bouncer check$' &&
+          has "Deadline 2026-10-11 12:00 UTC · 3 review attempts left" ;;
     number-repo-flag) ! called '^repo view' ;;
     key-from-env|key-trimmed) [ "$(cat "$STUB/secret_value")" = "sk-ant-test" ] && ! called 'sk-ant' ;;
     key-not-a-key|no-key-no-tty|set-key-no-tty) [ ! -f "$STUB/secret_value" ] && [ "$(dispatches)" = 0 ] ;;
@@ -61,8 +70,10 @@ check() {  # extra assertions per test
     fork-of-fork-no-workflow|sync-own-branch) ! called 'merge-upstream' ;;
     dispatch-204) called '^run watch 555 ' ;;
     no-watch) ! called '^run watch' && ! called '^pr comment' ;;
+    closed-bounced) has "Don't force-push" && has "  • \`correct\`" && [ "$(dispatches)" = 0 ] ;;
     merged|closed*|already-passed|skip-label|not-waiting|override|open-*|fail-label-stale|from-upstream|fork-deleted)
       [ "$(dispatches)" = 0 ] && ! called 'secret' ;;
+    forged-state) [ "$(dispatches)" = 1 ] ;;
     no-color|no-color-env|no-color-clicolor) ! grep -q $'\e' <<<"$out" ;;
     color-forced|color-force-tty) grep -q $'\e\\[32m✓' <<<"$out" ;;
     help) has "LEARN MORE" && has "EXIT CODES" ;;
@@ -109,8 +120,24 @@ ENVS="GH_FORCE_TTY=1 NO_COLOR=1" run no-color-env 0 "$DONE"                 has_
 ENVS="GH_FORCE_TTY=1 CLICOLOR=0" run no-color-clicolor 0 "$DONE"            has_secret -- "$URL"
 
 # --- before spending anything: nothing to run, or nothing that can run
+run merged              0 "up/repo#7 is already merged. Nothing to do."       pr_merged -- "$URL"
 S_STATE=none run closed 1 "up/repo#7 is closed."                              pr_closed -- "$URL"
-run from-upstream       1 "Bouncer reviews pull requests from forks"          pr_from_upstream -- "$URL"
+S_STATE="$BOUNCED" run closed-bounced 1 "up/repo#7 was bounced and closed."   pr_closed -- "$URL"
+S_STATE="${BOUNCED/$SHA/$OLD}" run closed-bounced-pushed-since 1 "Reopen the pull request (you've already pushed new commits)." pr_closed -- "$URL"
+S_STATE="$(st exhausted '"left":0')" run closed-exhausted 1 "used all its review attempts and was closed" pr_closed -- "$URL"
+S_STATE="$(st expired)" run closed-expired 1 "no review arrived before the deadline" pr_closed -- "$URL"
+S_STATE="$(st wrong_base '"base":"dev"')" run closed-wrong-base 1 "its base branch (dev) isn't one this project takes" pr_closed -- "$URL"
+S_LABELS=bouncer:pass S_STATE="$(st pass)" run already-passed 0 "up/repo#7 already passed the bouncer review. Nothing to do." -- "$URL"
+S_LABELS=bouncer:pass S_STATE="$(st pass | sed "s/$SHA/$OLD/")" run passed-earlier-commit 0 "That was for an earlier commit." -- "$URL"
+S_LABELS=bouncer:skip run skip-label 0 "A maintainer labeled up/repo#7 bouncer:skip"  -- "$URL"
+S_LABELS='' S_STATE=none run not-waiting 0 "isn't waiting for a bouncer review"  -- "$URL"
+S_LABELS='' S_STATE="$(st override)" run override 0 "set the bouncer's verdict aside" -- "$URL"
+S_LABELS=bouncer:fail S_STATE="$BOUNCED" run open-bounced 1 "up/repo#7 was bounced. It stays open" -- "$URL"
+S_LABELS=bouncer:fail S_STATE="$(st wrong_base)" run open-wrong-base 1 "Change its base branch" -- "$URL"
+S_LABELS=bouncer:fail S_STATE="${BOUNCED/$SHA/$OLD}" run fail-label-stale 0 "hasn't caught up" -- "$URL"
+S_STATE="$(st quarantined)" run unknown-status 0 "doesn't know"              has_secret -- "$URL"
+run forged-state        0 "$DONE"                                           has_secret forged -- "$URL"
+run from-upstream       0 "doesn't need a bouncer review"                     pr_from_upstream -- "$URL"
 run fork-deleted        1 "The fork behind up/repo#7 was deleted"             fork_deleted -- "$URL"
 run not-fork-owner      1 "You need admin rights on fork/repo"                fork_not_admin -- "$URL"
 
