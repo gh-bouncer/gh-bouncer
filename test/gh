@@ -4,22 +4,40 @@ printf '%s\n' "$*" >> "$STUB/calls.log"
 flag() { [ -f "$STUB/$1" ]; }
 case "$*" in
   "pr view"*) flag no_branch_pr && exit 1; echo "https://github.com/up/repo/pull/7" ;;
-  "repo view"*) echo "up/repo" ;;
+  "repo view --json nameWithOwner,parent"*) echo "up/repo" ;;
+  "repo view"*) echo "me/proj" ;;
+  # --- init ---
+  "api repos/me/proj --jq"*)
+    admin=true; flag not_admin && admin=false
+    fork=false; flag is_fork && fork=true
+    printf '%s\t%s\tmain\n' "$admin" "$fork" ;;
+  "api repos/gh-bouncer/action/contents/templates/bouncer.yml?ref=v1 "*) printf 'name: Bouncer\n' ;;
+  "api repos/gh-bouncer/action/contents/templates/.bouncer.yml?ref=v1 "*) printf 'version: 1\n' ;;
+  "api repos/me/proj/git/ref/heads/main --jq .object.sha") echo abc123 ;;
+  "api -X POST repos/me/proj/git/refs -f ref=refs/heads/bouncer-setup -f sha=abc123") flag branch_exists && exit 1; true ;;
+  "api -X DELETE repos/me/proj/git/refs/heads/bouncer-setup") touch "$STUB/branch_deleted" ;;
+  "api -X GET repos/me/proj/contents/.bouncer.yml -f ref=bouncer-setup --jq .sha") flag has_config && echo cfgsha && exit 0; exit 1 ;;
+  "api -X GET repos/me/proj/contents/"*) exit 1 ;;
+  "api -X PUT repos/me/proj/contents/.github/workflows/bouncer.yml "*)
+    if flag no_workflow_scope; then echo "refusing to allow an OAuth App to create or update workflow without workflow scope" >&2; exit 1; fi
+    touch "$STUB/put_workflow" ;;
+  "api -X PUT repos/me/proj/contents/.bouncer.yml "*) touch "$STUB/put_config" ;;
+  "pr create -R me/proj "*) echo "https://github.com/me/proj/pull/1" ;;
   "api repos/up/repo/pulls/7 "*)
     state=open; flag pr_closed && state=closed
     head="fork/repo"; flag pr_from_upstream && head="up/repo"
     printf '%s\t%s\t%s\t%s\n' "$state" "$head" "${HEAD_REF:-feature}" "https://github.com/up/repo/pull/7" ;;
   "api repos/fork/repo --jq"*) printf 'true\tmain\n' ;;
-  "api -X GET repos/fork/repo/contents/"*) flag no_workflow && ! flag synced && exit 1; echo ".github/workflows/bouncer-review.yml" ;;
+  "api -X GET repos/fork/repo/contents/"*) flag no_workflow && ! flag synced && exit 1; echo ".github/workflows/bouncer.yml" ;;
   "api -X POST repos/fork/repo/merge-upstream"*) touch "$STUB/synced"; echo '{}' ;;
-  "api repos/fork/repo/actions/workflows/bouncer-review.yml --jq .state")
+  "api repos/fork/repo/actions/workflows/bouncer.yml --jq .state")
     if flag wf_disabled && ! flag wf_enabled; then echo disabled_fork; else echo active; fi ;;
   "api -X PUT repos/fork/repo/actions/permissions"*) ;;
-  "api -X PUT repos/fork/repo/actions/workflows/bouncer-review.yml/enable") flag wf_cannot_enable || touch "$STUB/wf_enabled" ;;
+  "api -X PUT repos/fork/repo/actions/workflows/bouncer.yml/enable") flag wf_cannot_enable || touch "$STUB/wf_enabled" ;;
   "secret list"*) if flag has_secret; then echo 1; else echo 0; fi ;;
   "secret set ANTHROPIC_API_KEY -R fork/repo") cat > "$STUB/secret_value" ;;
   "run list"*) if flag dispatched; then echo 555; else echo 100; fi ;;
-  "api -X POST repos/fork/repo/actions/workflows/bouncer-review.yml/dispatches"*)
+  "api -X POST repos/fork/repo/actions/workflows/bouncer.yml/dispatches"*)
     touch "$STUB/dispatched"; flag dispatch_204 || echo '{"workflow_run_id": 4242, "run_url": "x", "html_url": "y"}' ;;
   "run watch"*) flag run_fails && exit 1; echo "run ok" ;;
   "pr comment 7 -R up/repo --body /bouncer check") ;;

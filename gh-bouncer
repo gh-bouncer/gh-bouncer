@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
 # gh bouncer: run the bouncer review for your pull request, in your fork, on your own API key.
-# https://github.com/pr-bouncer/bouncer
+# https://github.com/gh-bouncer/gh-bouncer
 set -euo pipefail
 
-VERSION="0.1.0"
-WORKFLOW="bouncer-review.yml"
+VERSION="0.2.0"
+WORKFLOW="bouncer.yml"
 WORKFLOW_PATH=".github/workflows/$WORKFLOW"
 POLL_SECONDS="${GH_BOUNCER_POLL_SECONDS:-3}"
+ACTION_REPO="gh-bouncer/action"
+ACTION_REF="${GH_BOUNCER_ACTION_REF:-v1}"
+SETUP_BRANCH="bouncer-setup"
 
 usage() {
   cat <<'EOF'
-Usage: gh bouncer [<pr-url> | <owner/repo#number> | <number>] [flags]
+Usage:
+  gh bouncer [<pr-url> | <owner/repo#number> | <number>] [flags]
+  gh bouncer init [-R OWNER/REPO]
 
-Runs the bouncer review for your pull request in your fork, on your own
-Anthropic API key, and tells the project's gate when it's done.
+gh bouncer <pr> runs the bouncer review for your pull request in your fork,
+on your own Anthropic API key, and tells the project's gate when it's done.
+With no argument, it uses the pull request for the current branch.
 
-With no argument, uses the pull request for the current branch.
+gh bouncer init is for maintainers: it opens a pull request that installs
+bouncer in your repository.
 
 Flags:
   -R, --repo OWNER/REPO   Upstream repository, when giving just a number
@@ -31,6 +38,101 @@ EOF
 
 die() { printf 'gh bouncer: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*" >&2; }
+
+# --- gh bouncer init: install bouncer in a repository (maintainers) ----------------
+init_usage() {
+  cat <<'EOF'
+Usage: gh bouncer init [-R OWNER/REPO]
+
+Opens a pull request in your repository that adds:
+  .github/workflows/bouncer.yml   the gate, plus the review job forks inherit
+  .bouncer.yml                    model, deadlines and rules (kept if it exists)
+EOF
+}
+
+INIT_REPO=""
+INIT_TMP=""
+ADDED=""
+
+# put_file <path in repo> <local file> <commit message> <keep existing: yes|no>
+put_file() {
+  local path="$1" src="$2" message="$3" keep="$4" existing out
+  existing="$(gh api -X GET "repos/$INIT_REPO/contents/$path" -f ref="$SETUP_BRANCH" --jq .sha 2>/dev/null || true)"
+  if [ -n "$existing" ] && [ "$keep" = "yes" ]; then
+    say "Keeping your existing $path."
+    return 0
+  fi
+  local args=(-X PUT "repos/$INIT_REPO/contents/$path" -f message="$message" -f branch="$SETUP_BRANCH"
+    -f content="$(base64 <"$src" | tr -d '\n')")
+  [ -z "$existing" ] || args+=(-f sha="$existing")
+  if ! out="$(gh api "${args[@]}" 2>&1)"; then
+    gh api -X DELETE "repos/$INIT_REPO/git/refs/heads/$SETUP_BRANCH" >/dev/null 2>&1 || true
+    case "$out" in
+      *workflow*) die "GitHub needs the 'workflow' permission to add workflow files. Run: gh auth refresh -s workflow, then gh bouncer init again." ;;
+      *) die "couldn't write $path: $out" ;;
+    esac
+  fi
+  ADDED="${ADDED}- \`$path\`"$'\n'
+}
+
+cmd_init() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) init_usage; exit 0 ;;
+      -R|--repo) [ $# -ge 2 ] || die "$1 needs OWNER/REPO"; INIT_REPO="$2"; shift 2 ;;
+      --repo=*) INIT_REPO="${1#--repo=}"; shift ;;
+      *) die "unknown argument: $1 (see gh bouncer init --help)" ;;
+    esac
+  done
+  if [ -z "$INIT_REPO" ]; then
+    INIT_REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)" ||
+      die "run this inside a clone of your repository, or pass -R OWNER/REPO"
+  fi
+
+  local is_admin is_fork default_branch
+  IFS=$'\t' read -r is_admin is_fork default_branch < <(
+    gh api "repos/$INIT_REPO" --jq '[(.permissions.admin // false), .fork, .default_branch] | @tsv' 2>/dev/null
+  ) || die "repository $INIT_REPO was not found"
+  [ "$is_admin" = "true" ] || die "you need admin rights on $INIT_REPO to install bouncer"
+  [ "$is_fork" != "true" ] || die "$INIT_REPO is a fork. Run gh bouncer init in the project itself."
+
+  INIT_TMP="$(mktemp -d)"
+  trap 'rm -rf "$INIT_TMP"' EXIT
+  gh api "repos/$ACTION_REPO/contents/templates/bouncer.yml?ref=$ACTION_REF" \
+    -H "Accept: application/vnd.github.raw" >"$INIT_TMP/workflow" 2>/dev/null ||
+    die "couldn't download the bouncer workflow template from $ACTION_REPO"
+  gh api "repos/$ACTION_REPO/contents/templates/.bouncer.yml?ref=$ACTION_REF" \
+    -H "Accept: application/vnd.github.raw" >"$INIT_TMP/config" 2>/dev/null ||
+    die "couldn't download the .bouncer.yml template from $ACTION_REPO"
+
+  local base_sha
+  base_sha="$(gh api "repos/$INIT_REPO/git/ref/heads/$default_branch" --jq .object.sha 2>/dev/null)" ||
+    die "couldn't read $INIT_REPO's $default_branch branch"
+  gh api -X POST "repos/$INIT_REPO/git/refs" -f ref="refs/heads/$SETUP_BRANCH" -f sha="$base_sha" >/dev/null 2>&1 ||
+    die "couldn't create the $SETUP_BRANCH branch in $INIT_REPO. If it already exists, merge or delete it first."
+
+  put_file ".github/workflows/bouncer.yml" "$INIT_TMP/workflow" "Add bouncer workflow" no
+  put_file ".bouncer.yml" "$INIT_TMP/config" "Add bouncer settings" yes
+
+  local body pr_url
+  body="This installs [bouncer](https://github.com/gh-bouncer/gh-bouncer). Pull requests from people without write access are held until the contributor runs a signed review in their fork, on their own Anthropic API key. Maintainers pay nothing.
+
+Adds:
+${ADDED}
+Before merging, edit the \`rules\` and \`guidance\` in \`.bouncer.yml\` to match this project. Guidance about scope and what you never accept matters most.
+
+Members, collaborators, prior contributors and listed bots are exempt, and so is any pull request labeled \`bouncer:skip\`."
+  pr_url="$(gh pr create -R "$INIT_REPO" --base "$default_branch" --head "$SETUP_BRANCH" --title "Add bouncer" --body "$body")" ||
+    die "the files are on the $SETUP_BRANCH branch, but opening the pull request failed. Open it from https://github.com/$INIT_REPO/compare/$SETUP_BRANCH"
+  say "Opened $pr_url"
+  say "Edit the rules and guidance in .bouncer.yml on that branch, then merge it to turn bouncer on."
+}
+
+if [ "${1:-}" = "init" ]; then
+  shift
+  cmd_init "$@"
+  exit 0
+fi
 
 ARG=""
 UPSTREAM=""

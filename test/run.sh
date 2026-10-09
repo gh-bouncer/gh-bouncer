@@ -29,6 +29,12 @@ check() {  # extra per-test assertions
     sync) [ -f "$STUB/synced" ] ;;
     poll) grep -q 'runs/555' <<<"$out" ;;
     no-watch) ! grep -q '^run watch' "$STUB/calls.log" ;;
+    init) [ -f "$STUB/put_workflow" ] && [ -f "$STUB/put_config" ] &&
+          grep -q 'bmFtZTogQm91bmNlcgo=' "$STUB/calls.log" &&
+          grep -q '^pr create -R me/proj --base main --head bouncer-setup --title Add bouncer' "$STUB/calls.log" &&
+          grep -qF -- "- \`.bouncer.yml\`" "$STUB/calls.log" ;;
+    init-keep-config) [ -f "$STUB/put_workflow" ] && [ ! -f "$STUB/put_config" ] ;;
+    init-no-scope) [ -f "$STUB/branch_deleted" ] ;;
     *) true ;;
   esac
 }
@@ -51,6 +57,14 @@ run from-upstream  1 "Bouncer reviews pull requests from forks" pr_from_upstream
 run no-pr-branch   1 "no pull request found"             no_branch_pr --
 run bad-url        1 "not a pull request URL"            -- https://github.com/up/repo/issues/7
 run bad-number     1 "is not a pull request number"      -- abc
+
+run init             0 "Opened https://github.com/me/proj/pull/1" -- init
+run init-explicit    0 "Opened"                            -- init -R me/proj
+run init-keep-config 0 "Keeping your existing .bouncer.yml" has_config -- init
+run init-no-scope    1 "gh auth refresh -s workflow"       no_workflow_scope -- init
+run init-not-admin   1 "need admin rights"                 not_admin -- init
+run init-fork        1 "is a fork"                         is_fork -- init
+run init-branch      1 "If it already exists, merge or delete"   branch_exists -- init
 
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
