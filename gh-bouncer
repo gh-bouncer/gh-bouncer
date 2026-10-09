@@ -3,7 +3,7 @@
 # https://github.com/gh-bouncer/gh-bouncer
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 WORKFLOW="bouncer.yml"
 WORKFLOW_PATH=".github/workflows/$WORKFLOW"
 ACTION_REPO="gh-bouncer/action"

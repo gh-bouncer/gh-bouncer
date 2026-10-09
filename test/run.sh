@@ -144,7 +144,7 @@ run no-pr-branch        1 "No pull request found for the current branch."     no
 
 # --- gh conventions: help, version, flags, errors, exit codes, colors
 run help                0 "USAGE"                                             -- --help
-run version             0 "gh bouncer version 0.2.0"                          -- --version
+run version             0 "gh bouncer version 0.3.0"                          -- --version
 run unknown-flag        1 "Unknown flag: --frobnicate"                        -- --frobnicate "$URL"
 run not-logged-in       4 "Run gh auth login, then try again."                no_auth -- "$URL"
 run not-logged-in-branch 4 "You're not logged in to GitHub CLI."              no_auth --
