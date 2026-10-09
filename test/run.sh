@@ -109,7 +109,7 @@ check() {  # extra assertions per test
     bounce-open) has "A new review starts on your key automatically." ;;
     verdict-timeout|comment-fails) has "The result will appear on $URL" ;;
     closed-bounced) has "Don't force-push" && has "  • \`correct\`" && [ "$(dispatches)" = 0 ] ;;
-    merged|closed*|already-passed|skip-label|not-waiting|override|open-*|fail-label-stale|from-upstream|fork-deleted)
+    merged|closed*|already-passed|skip-label|not-waiting|override|open-*|fail-label-stale|from-upstream|fork-deleted|draft-pr)
       [ "$(dispatches)" = 0 ] && ! called 'secret' ;;
     forged-state) [ "$(dispatches)" = 1 ] ;;
     no-color|no-color-env|no-color-clicolor) ! grep -q $'\e' <<<"$out" ;;
@@ -166,6 +166,7 @@ S_STATE="$(st exhausted '"left":0')" run closed-exhausted 1 "used all its review
 S_STATE="$(st expired)" run closed-expired 1 "no review arrived before the deadline" pr_closed -- "$URL"
 S_STATE="$(st wrong_base '"base":"dev"')" run closed-wrong-base 1 "its base branch (dev) isn't one this project takes" pr_closed -- "$URL"
 S_LABELS=bouncer:pass S_STATE="$(st pass)" run already-passed 0 "up/repo#7 already passed the bouncer review. Nothing to do." -- "$URL"
+S_LABELS='' S_STATE="$(st draft)" run draft-pr 0 "up/repo#7 is a draft, so the bouncer isn't asking for a review yet." -- "$URL"
 S_LABELS=bouncer:pass S_STATE="$(st pass | sed "s/$SHA/$OLD/")" run passed-earlier-commit 0 "That was for an earlier commit." -- "$URL"
 S_LABELS=bouncer:skip run skip-label 0 "A maintainer labeled up/repo#7 bouncer:skip"  -- "$URL"
 S_LABELS='' S_STATE=none run not-waiting 0 "isn't waiting for a bouncer review"  -- "$URL"
