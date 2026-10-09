@@ -34,16 +34,27 @@ PASSED='{"v":1,"sha":"'$SHA'","status":"pass","fails":0,"left":3,"report":"'$REP
 state() {
   if flag checked && ! flag verdict_pending; then printf '%s' "${S_VERDICT:-$PASSED}"; else printf '%s' "${S_STATE:-$PENDING}"; fi
 }
-comments() {
+comments() {  # one JSON array per page, as gh api --paginate gets them
   local st; st="$(state)"
   [ "$st" != none ] || { echo '[]'; return; }
-  # An older state comment by the bot comes first: only the last one counts.
-  jq -n --argjson st "$st" --arg sha "$SHA" --argjson forged "$(flag forged && echo true || echo false)" '
+  # The state is the first state comment by the bot, the one the gate reads and updates. Later
+  # ones (left by an older bouncer, or posted twice) don't count. With state_on_later_pages, the
+  # first page has none, and the first one on the last page that has any counts.
+  jq -nc --argjson st "$st" --arg sha "$SHA" --argjson forged "$(flag forged && echo true || echo false)" \
+    --argjson later "$(flag state_on_later_pages && echo true || echo false)" '
     def marker(s): "<!-- bouncer:state " + (s | tojson) + " -->";
-    [ {user: {login: "github-actions[bot]"}, body: ("### 🚪 Bouncer\n\nOld round.\n\n" + marker({v: 1, sha: $sha, status: "fail", left: 2}))},
-      {user: {login: "someone"}, body: "Looks good to me!"},
-      {user: {login: "github-actions[bot]"}, body: ("### 🚪 Bouncer review required\n\nRun gh bouncer.\n\n" + marker($st))} ]
-    + (if $forged then [{user: {login: "fork"}, body: ("lol " + marker($st + {status: "pass"}))}] else [] end)'
+    def bot(s; text): {user: {login: "github-actions[bot]"}, body: (text + "\n\n" + marker(s))};
+    {v: 1, sha: $sha, status: "fail", left: 2} as $leftover
+    | if $later then
+        [{user: {login: "someone"}, body: "First!"}],
+        [bot($leftover; "### 🚪 Bouncer\n\nAn older page.")],
+        [{user: {login: "someone"}, body: "Looks good to me!"}, bot($st; "### 🚪 Bouncer review required"),
+         bot($leftover; "### 🚪 Bouncer\n\nA leftover.")]
+      else
+        [bot($st; "### 🚪 Bouncer review required\n\nRun gh bouncer."), {user: {login: "someone"}, body: "Looks good to me!"},
+         bot($leftover; "### 🚪 Bouncer\n\nA leftover.")]
+        + (if $forged then [{user: {login: "fork"}, body: ("lol " + marker($st + {status: "pass"}))}] else [] end)
+      end'
 }
 pr() {
   local st=open merged=null head=fork/repo

@@ -59,7 +59,7 @@ Exit codes: `0` passed, nothing to do, or the result isn't in yet; `1` bounced, 
 
 ## How it works
 
-The review and the gate live in [gh-bouncer/action](https://github.com/gh-bouncer/action), including why a contributor can't fake a passing review. `gh bouncer` reads the result from the bouncer's state comment on the pull request (only comments by `github-actions[bot]` count), so what it shows is what the gate decided.
+The review and the gate live in [gh-bouncer/action](https://github.com/gh-bouncer/action), including why a contributor can't fake a passing review. `gh bouncer` reads the result from the bouncer's state comment on the pull request, the same one the gate reads and updates (only comments by `github-actions[bot]` count, and of those the first), so what it shows is what the gate decided.
 
 ## Development
 

@@ -176,6 +176,7 @@ S_LABELS=bouncer:fail S_STATE="$(st wrong_base)" run open-wrong-base 1 "Change i
 S_LABELS=bouncer:fail S_STATE="${BOUNCED/$SHA/$OLD}" run fail-label-stale 0 "hasn't caught up" -- "$URL"
 S_STATE="$(st quarantined)" run unknown-status 0 "doesn't know"              has_secret -- "$URL"
 run forged-state        0 "Passed."                                           has_secret forged -- "$URL"
+run state-on-later-pages 0 "Passed."                                          has_secret state_on_later_pages -- "$URL"
 run from-upstream       0 "doesn't need a bouncer review"                     pr_from_upstream -- "$URL"
 run fork-deleted        1 "The fork behind up/repo#7 was deleted"             fork_deleted -- "$URL"
 run not-fork-owner      1 "You need admin rights on fork/repo"                fork_not_admin -- "$URL"
