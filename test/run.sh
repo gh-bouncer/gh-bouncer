@@ -3,6 +3,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN="$HERE/../gh-bouncer"
+command -v jq >/dev/null || { echo "test/run.sh needs jq: the stub applies the script's --jq filters with it"; exit 1; }
 pass=0; fail=0
 
 run() {  # run <name> <expect-exit> <expect-in-output> [setup flags...] -- [args...]
@@ -62,7 +63,7 @@ run init             0 "Opened https://github.com/me/proj/pull/1" -- init
 run init-explicit    0 "Opened"                            -- init -R me/proj
 run init-keep-config 0 "Keeping your existing .bouncer.yml" has_config -- init
 run init-no-scope    1 "gh auth refresh -s workflow"       no_workflow_scope -- init
-run init-not-admin   1 "need admin rights"                 not_admin -- init
+run init-not-admin   1 "need admin rights"                 no_write -- init
 run init-fork        1 "is a fork"                         is_fork -- init
 run init-branch      1 "If it already exists, merge or delete"   branch_exists -- init
 

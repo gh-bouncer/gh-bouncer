@@ -54,4 +54,4 @@ The review and the gate live in [gh-bouncer/action](https://github.com/gh-bounce
 
 ## Development
 
-`test/run.sh` runs the script against a stub `gh`. CI also runs `shellcheck`.
+`test/run.sh` runs the script against a stub `gh` (`test/gh`), offline. The stub answers with GitHub-shaped JSON and applies the script's `--jq` filters with `jq`, so it needs `jq` installed. CI also runs `shellcheck`.
