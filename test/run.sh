@@ -78,7 +78,7 @@ check() {  # extra assertions per test
   case "$1" in
     pass) called "dispatches -f ref=main -f inputs\[pr\]=7 -f inputs\[upstream\]=up/repo" &&
           called '^pr comment 7 -R up/repo --body /bouncer check$' &&
-          has "Review: $REPORT" && has "reviewed automatically, on your key" &&
+          has "Review: $REPORT" && has "usually reviewed automatically, on your key" &&
           has "Deadline 2026-10-11 12:00 UTC · 3 review attempts left" ;;
     number-repo-flag) ! called '^repo view' ;;
     key-from-env|key-trimmed) [ "$(cat "$STUB/secret_value")" = "sk-ant-test" ] && ! called 'sk-ant' ;;
@@ -106,7 +106,7 @@ check() {  # extra assertions per test
     run-fails-after-signing) has "but the review was signed, so it counts" ;;
     bounce) has "  • \`not-duplicate\` (Required, 92% confidence)" && has "To try again (2 review attempts left):" &&
             has "Don't force-push" && has "2. Reopen the pull request." && has "3. Run gh bouncer $URL" && has "Full review: $REPORT" ;;
-    bounce-open) has "A new review starts on your key automatically." ;;
+    bounce-open) has "A new review usually starts on your key" && has "still asks for one, run gh bouncer again." ;;
     verdict-timeout|comment-fails) has "The result will appear on $URL" ;;
     closed-bounced) has "Don't force-push" && has "  • \`correct\`" && [ "$(dispatches)" = 0 ] ;;
     merged|closed*|already-passed|skip-label|not-waiting|override|open-*|fail-label-stale|from-upstream|fork-deleted|draft-pr)

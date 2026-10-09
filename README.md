@@ -42,7 +42,7 @@ If the review run fails (an invalid key, no credits left, rate limits...), it sa
 
 Ctrl-C only stops watching. The review keeps running in your fork, and the bouncer still posts the result on the pull request.
 
-If your pull request's branch has the bouncer workflow, every push to it starts a new review on your key automatically. A branch made before the project installed bouncer doesn't have it: merge the project's default branch into it, or run `gh bouncer` again after each push. `gh bouncer` tells you which applies.
+If your pull request's branch has the bouncer workflow, a push to it usually starts the review on your key by itself, when the bouncer asks for one. A branch made before the project installed bouncer doesn't have the workflow: merge the project's default branch into it, or run `gh bouncer` again after each push. `gh bouncer` tells you which applies. Either way, if the bouncer still asks for a review after a push, run `gh bouncer` again.
 
 ```
 gh bouncer [<pr-url> | <owner/repo#number> | <number>] [flags]

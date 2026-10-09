@@ -644,7 +644,7 @@ ask_key() {
     say ""
     say "The review runs on your own Anthropic API key, saved only as an Actions secret in $HEAD_REPO."
     say "Every review is billed to your key${B_MODEL:+: this project reviews with $B_MODEL${B_EFFORT:+ at $B_EFFORT effort}}."
-    [ -z "$AUTO" ] || say "A new review also starts on its own each time you push to this pull request."
+    [ -z "$AUTO" ] || say "When the bouncer asks for a new review after you push to this pull request, it usually starts on its own."
     gray "Get a key at $KEYS_URL"
     printf '%s?%s Anthropic API key %s(input hidden)%s ' "$C_OK" "$C_OFF" "$C_GRAY" "$C_OFF" >&2
     IFS= read -rs key || true
@@ -869,7 +869,8 @@ say ""
 
 auto_note() {
   if [ -n "$AUTO" ]; then
-    gray "New commits you push to this pull request are reviewed automatically, on your key."
+    gray "New commits you push to this pull request are usually reviewed automatically, on your key."
+    gray "If the bouncer still asks for a review after a push, run gh bouncer again."
   else
     gray "Your branch $HEAD_REF doesn't have the bouncer workflow, so new commits aren't reviewed automatically."
     gray "Merge the latest $UPSTREAM into it to change that, or run gh bouncer again after each push."
@@ -908,7 +909,8 @@ case "$RESULT" in
     elif [ "$B_LEFT" = 0 ]; then
       no_attempts_left
     elif [ -n "$AUTO" ]; then
-      say "To try again$(attempts_left): push your fixes as new commits. A new review starts on your key automatically."
+      say "To try again$(attempts_left): push your fixes as new commits. A new review usually starts on your key"
+      say "automatically. If the bouncer still asks for one, run gh bouncer again."
     else
       say "To try again$(attempts_left): push your fixes as new commits, then run gh bouncer again."
     fi
