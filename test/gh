@@ -117,6 +117,14 @@ case "$*" in
       '{fork: $fork, default_branch: $db, permissions: {admin: $push, push: $push}, parent: (if $fork then {full_name: "up/proj"} else null end)}' | out ;;
   "api repos/gh-bouncer/action/contents/templates/bouncer.yml?ref=v1 "*) printf 'name: Bouncer\n' ;;
   "api repos/gh-bouncer/action/contents/templates/.bouncer.yml?ref=v1 "*) printf 'version: 1\n' ;;
+  "api repos/me/proj/contents/.github/workflows/bouncer.yml?ref=$DB "*)
+    flag installed_same && { printf 'name: Bouncer\n'; exit 0; }
+    flag installed_old && { printf 'name: Bouncer (old)\n'; exit 0; }
+    not_found ;;
+  "api repos/me/proj/git/ref/heads/bouncer-setup --jq .ref")
+    flag branch_exists || not_found; echo '{"ref":"refs/heads/bouncer-setup"}' | out ;;
+  "pr list -R me/proj --head bouncer-setup "*)
+    if flag setup_pr_open; then echo '[{"url":"https://github.com/me/proj/pull/1"}]'; else echo '[]'; fi | out ;;
   "api repos/me/proj/git/ref/heads/$DB --jq .object.sha") echo '{"object":{"sha":"abc123"}}' | out ;;
   "api -X POST repos/me/proj/git/refs -f ref=refs/heads/bouncer-setup -f sha=abc123")
     flag branch_exists && fail "gh: Reference already exists (HTTP 422)"; touch "$STUB/branch_created" ;;

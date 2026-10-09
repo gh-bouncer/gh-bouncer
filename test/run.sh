@@ -66,12 +66,18 @@ check() {  # extra assertions per test
     no-color|no-color-env|no-color-clicolor) ! grep -q $'\e' <<<"$out" ;;
     color-forced|color-force-tty) grep -q $'\e\\[32m✓' <<<"$out" ;;
     help) has "LEARN MORE" && has "EXIT CODES" ;;
-    init) [ -f "$STUB/put_workflow" ] && [ -f "$STUB/put_config" ] && called 'content=bmFtZTogQm91bmNlcgo=' &&
-          grep -qx 'Add bouncer' "$STUB/pr_create" && grep -qF -- "- \`.bouncer.yml\`" "$STUB/pr_create" ;;
+    init) [ -f "$STUB/put_workflow" ] && [ -f "$STUB/put_config" ] &&
+          called 'content=bmFtZTogQm91bmNlcgo=' &&
+          grep -qx 'Add bouncer' "$STUB/pr_create" &&
+          grep -qF -- "- \`.bouncer.yml\`: the Repo Config (review agent" "$STUB/pr_create" &&
+          grep -qF "Past contributors are not" "$STUB/pr_create" &&
+          ! grep -qi "prior contributors.* are exempt\|past contributors and" "$STUB/pr_create" &&
+          has "Next:" && has "2. Merge the pull request to turn bouncer on" ;;
     init-explicit) ! called '^repo view' ;;
-    init-keep-config) [ -f "$STUB/put_workflow" ] && [ ! -f "$STUB/put_config" ] ;;
+    init-keep-config) [ -f "$STUB/put_workflow" ] && [ ! -f "$STUB/put_config" ] && grep -qF ".bouncer.yml\`: kept" "$STUB/pr_create" ;;
     init-no-scope) [ -f "$STUB/branch_deleted" ] ;;
     init-installed|init-setup-pr|init-setup-branch|init-fork|init-no-write) [ ! -f "$STUB/branch_created" ] ;;
+    init-update) grep -qx 'Update bouncer workflow' "$STUB/pr_create" && called 'sha=wfsha' ;;
     *) true ;;
   esac
 }
@@ -134,9 +140,12 @@ run init                0 "Opened https://github.com/me/proj/pull/1"          --
 run init-explicit       0 "Opened"                                            -- init -R me/proj
 run init-keep-config    0 "Kept your existing .bouncer.yml"                   has_config -- init
 run init-no-scope       1 "gh auth refresh -s workflow"                       no_workflow_scope -- init
-run init-not-admin      1 "You need admin rights on me/proj"                  no_write -- init
-run init-fork           1 "is a fork. Run gh bouncer init in the project itself." is_fork -- init
-run init-branch         1 "If it already exists, merge or delete it first."   branch_exists -- init
+run init-no-write       1 "You need write access to me/proj"                  no_write -- init
+run init-fork           1 "gh bouncer init -R up/proj"                        is_fork -- init
+run init-installed      0 "Bouncer is already installed in me/proj"           installed_same -- init
+run init-update         0 "Opened"                                            installed_old -- init
+run init-setup-pr       1 "There's already a bouncer setup pull request: https://github.com/me/proj/pull/1" branch_exists setup_pr_open -- init
+run init-setup-branch   1 "already exists in me/proj, with no open pull request" branch_exists -- init
 run init-not-repo       1 "Not in a clone of a GitHub repository."            not_repo -- init
 run init-not-logged-in  4 "gh auth login"                                     no_auth -- init
 run init-unknown-arg    1 "Unknown argument: foo"                             -- init foo

@@ -117,7 +117,7 @@ EOF
 # --- gh bouncer init: install bouncer in a repository (maintainers) ----------------
 init_usage() {
   cat <<EOF
-Open a pull request that installs bouncer in your repository.
+Open a pull request that installs bouncer in your repository, or updates its workflow.
 
 USAGE
   gh bouncer init [-R OWNER/REPO]
@@ -128,7 +128,11 @@ FLAGS
 
 It adds:
   .github/workflows/bouncer.yml   the gate, plus the review job forks inherit
-  .bouncer.yml                    model, deadlines and rules (kept if it exists)
+  .bouncer.yml                    the Repo Config: review agent, gate, pre-checks,
+                                  guidance and Agent Rules (kept if you have one)
+
+LEARN MORE
+  Build a .bouncer.yml in the browser: $SITE/#config
 EOF
 }
 
@@ -136,9 +140,9 @@ INIT_REPO=""
 ADDED=""
 
 drop_setup_branch() { gh api -X DELETE "repos/$INIT_REPO/git/refs/heads/$SETUP_BRANCH" >/dev/null 2>&1 || true; }
-# put_file <path in repo> <local file> <commit message> <keep existing: yes|no>
+# put_file <path in repo> <local file> <commit message> <keep existing: yes|no> <description>
 put_file() {
-  local path="$1" src="$2" message="$3" keep="$4" existing rc=0
+  local path="$1" src="$2" message="$3" keep="$4" what="$5" existing rc=0
   existing="$(api -X GET "repos/$INIT_REPO/contents/$path" -f ref="$SETUP_BRANCH" --jq .sha)" || rc=$?
   if [ "$rc" != 0 ]; then
     is_404 || { drop_setup_branch; gh_failed "$rc"; }
@@ -146,6 +150,7 @@ put_file() {
   fi
   if [ -n "$existing" ] && [ "$keep" = "yes" ]; then
     ok "Kept your existing $path"
+    ADDED="${ADDED}- \`$path\`: kept as it is"$'\n'
     return 0
   fi
   local args=(-X PUT "repos/$INIT_REPO/contents/$path" -f message="$message" -f branch="$SETUP_BRANCH"
@@ -162,8 +167,8 @@ put_file() {
     fi
     die "Couldn't add $path to $INIT_REPO: $(gh_msg)" "Nothing was changed. Run gh bouncer init again."
   fi
-  ok "Added $path"
-  ADDED="${ADDED}- \`$path\`"$'\n'
+  if [ -n "$existing" ]; then ok "Updated $path"; else ok "Added $path"; fi
+  ADDED="${ADDED}- \`$path\`: $what"$'\n'
 }
 
 cmd_init() {
@@ -185,12 +190,15 @@ cmd_init() {
   fi
   case "$INIT_REPO" in */?*) ;; *) die "'$INIT_REPO' isn't a repository. Use -R OWNER/REPO." ;; esac
 
-  local info is_admin is_fork default_branch
-  info="$(api "repos/$INIT_REPO" --jq '[(.permissions.admin // false), .fork, .default_branch] | @tsv')" ||
+  local info can_push is_fork default_branch parent
+  info="$(api "repos/$INIT_REPO" --jq '[(.permissions.push // false), .fork, .default_branch, (.parent.full_name // "")]
+    | map(tostring | if . == "" then "-" else . end) | join("\t")')" ||
     gh_failed $? "Repository $INIT_REPO doesn't exist, or you can't see it." "Check the name, or pass -R OWNER/REPO."
-  IFS=$'\t' read -r is_admin is_fork default_branch <<<"$info"
-  [ "$is_admin" = "true" ] || die "You need admin rights on $INIT_REPO to install bouncer."
-  [ "$is_fork" != "true" ] || die "$INIT_REPO is a fork. Run gh bouncer init in the project itself."
+  IFS=$'\t' read -r can_push is_fork default_branch parent <<<"$info"
+  [ "$is_fork" != "true" ] ||
+    die "$INIT_REPO is a fork of $parent. Install bouncer in the original project instead:" "gh bouncer init -R $parent"
+  [ "$can_push" = "true" ] ||
+    die "You need write access to $INIT_REPO to install bouncer." "Ask one of its maintainers to run gh bouncer init."
 
   local tmp
   tmp="$(mktemp -d)"
@@ -200,33 +208,89 @@ cmd_init() {
   api "repos/$ACTION_REPO/contents/templates/.bouncer.yml?ref=$ACTION_REF" -H "Accept: application/vnd.github.raw" >"$tmp/config" ||
     gh_failed $? "Couldn't find the .bouncer.yml template in $ACTION_REPO@$ACTION_REF."
 
+  # Already installed? Then there's nothing to do, or only the workflow to update.
+  local current update=""
+  current="$(api "repos/$INIT_REPO/contents/$WORKFLOW_PATH?ref=$default_branch" -H "Accept: application/vnd.github.raw")" || rc=$?
+  if [ "$rc" = 0 ]; then
+    if [ "$current" = "$(cat "$tmp/workflow")" ]; then
+      ok "Bouncer is already installed in $INIT_REPO, with the current workflow."
+      gray "Its settings are in .bouncer.yml on $default_branch. Build one at $SITE/#config"
+      exit 0
+    fi
+    update=1
+  elif ! is_404; then
+    gh_failed "$rc"
+  fi
+
+  # A setup branch left from an earlier run.
+  rc=0
+  api "repos/$INIT_REPO/git/ref/heads/$SETUP_BRANCH" --jq .ref >/dev/null || rc=$?
+  if [ "$rc" = 0 ]; then
+    local open_pr
+    open_pr="$(ghc pr list -R "$INIT_REPO" --head "$SETUP_BRANCH" --json url --jq '.[0].url // empty' || true)"
+    [ -z "$open_pr" ] ||
+      die "There's already a bouncer setup pull request: $open_pr" "Merge or close it, then run gh bouncer init again if you still need to."
+    die "The $SETUP_BRANCH branch already exists in $INIT_REPO, with no open pull request." \
+      "Delete it with: gh api -X DELETE repos/$INIT_REPO/git/refs/heads/$SETUP_BRANCH" "Then run gh bouncer init again."
+  elif ! is_404; then
+    gh_failed "$rc"
+  fi
+
   local base_sha
   base_sha="$(api "repos/$INIT_REPO/git/ref/heads/$default_branch" --jq .object.sha)" || gh_failed $?
   api -X POST "repos/$INIT_REPO/git/refs" -f ref="refs/heads/$SETUP_BRANCH" -f sha="$base_sha" >/dev/null || {
     rc=$?
     reachable "$rc"
-    die "Couldn't create the $SETUP_BRANCH branch in $INIT_REPO: $(gh_msg)" "If it already exists, merge or delete it first."
+    die "Couldn't create the $SETUP_BRANCH branch in $INIT_REPO: $(gh_msg)"
   }
 
-  put_file "$WORKFLOW_PATH" "$tmp/workflow" "Add bouncer workflow" no
-  put_file ".bouncer.yml" "$tmp/config" "Add bouncer settings" yes
+  local title body
+  if [ -n "$update" ]; then
+    title="Update bouncer workflow"
+    put_file "$WORKFLOW_PATH" "$tmp/workflow" "Update bouncer workflow" no "updated to the current template"
+    put_file ".bouncer.yml" "$tmp/config" "Add bouncer Repo Config" yes "the Repo Config, with the default settings"
+    body="This updates [bouncer]($SITE) in this repository to the current template from \`$ACTION_REPO@$ACTION_REF\`.
 
-  local body pr_url
-  body="This installs [bouncer](https://github.com/gh-bouncer/gh-bouncer). Pull requests from people without write access are held until the contributor runs a signed review in their fork, on their own Anthropic API key. Maintainers pay nothing.
-
-Adds:
+**Changes**
 ${ADDED}
-Before merging, edit the \`rules\` and \`guidance\` in \`.bouncer.yml\` to match this project. Guidance about scope and what you never accept matters most.
+If you changed the workflow by hand, check the diff and carry your changes over before merging. Settings stay in \`.bouncer.yml\`."
+  else
+    title="Add bouncer"
+    put_file "$WORKFLOW_PATH" "$tmp/workflow" "Add bouncer workflow" no "the gate for this repository, plus the review job that forks inherit"
+    put_file ".bouncer.yml" "$tmp/config" "Add bouncer Repo Config" yes "the Repo Config (review agent, gate, pre-checks, guidance and Agent Rules)"
+    body="This installs [bouncer]($SITE). Pull requests from people outside the team are held as drafts until their author runs an AI review in their own fork, on their own Anthropic API key, and GitHub signs the result. Passing pull requests reach you with the review attached; bounced ones are closed with the reasons. Maintainers pay nothing.
 
-Members, collaborators, prior contributors and listed bots are exempt, and so is any pull request labeled \`bouncer:skip\`."
-  pr_url="$(ghc pr create -R "$INIT_REPO" --base "$default_branch" --head "$SETUP_BRANCH" --title "Add bouncer" --body "$body")" || {
+**Adds**
+${ADDED}
+**Before merging**
+- Edit \`guidance\` in \`.bouncer.yml\`: what this project is for and what you never accept. It matters more than any other setting.
+- Check the Agent Rules. A broken Required rule (\`hard: true\`) fails a pull request; an Advisory rule (\`hard: false\`) is only reported to you. The [Repo Config builder]($SITE/#config) can generate the file.
+
+**After merging**
+- New outside pull requests get a comment telling the author to run \`gh bouncer <url>\`. Open ones are held the next time they're updated.
+- The repository's owners, members and collaborators are exempt, and so are the bots under \`exempt_users\`. Past contributors are not, unless you set \`exempt_prior_contributors: true\`. Label a pull request \`bouncer:skip\` to exempt it by hand, or reopen a bounced one yourself to override the verdict.
+- To try it on yourself, set \`exempt_maintainers: false\` under \`gate:\`, open a pull request from a fork and run \`gh bouncer <its url>\`."
+  fi
+
+  local pr_url
+  pr_url="$(ghc pr create -R "$INIT_REPO" --base "$default_branch" --head "$SETUP_BRANCH" --title "$title" --body "$body")" || {
     rc=$?
     reachable "$rc"
     die "The files are on the $SETUP_BRANCH branch, but opening the pull request failed: $(gh_msg)" \
       "Open it from https://github.com/$INIT_REPO/compare/$default_branch...$SETUP_BRANCH"
   }
   ok "Opened $pr_url"
-  gray "Edit the rules and guidance in .bouncer.yml on that branch, then merge it to turn bouncer on."
+  say ""
+  say "Next:"
+  if [ -n "$update" ]; then
+    say "  1. Check the changes and merge the pull request"
+    return 0
+  fi
+  say "  1. Edit guidance and Agent Rules in .bouncer.yml on the $SETUP_BRANCH branch"
+  gray "   or build the file at $SITE/#config"
+  say "  2. Merge the pull request to turn bouncer on"
+  say "  3. Try it: set exempt_maintainers: false, open a pull request from a fork,"
+  say "     and run gh bouncer <its url>"
 }
 
 if [ "${1:-}" = "init" ]; then
