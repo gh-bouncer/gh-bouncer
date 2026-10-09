@@ -6,72 +6,163 @@ set -euo pipefail
 VERSION="0.2.0"
 WORKFLOW="bouncer.yml"
 WORKFLOW_PATH=".github/workflows/$WORKFLOW"
-POLL_SECONDS="${GH_BOUNCER_POLL_SECONDS:-3}"
 ACTION_REPO="gh-bouncer/action"
 ACTION_REF="${GH_BOUNCER_ACTION_REF:-v1}"
 SETUP_BRANCH="bouncer-setup"
+SITE="https://gh-bouncer.com"
+POLL_SECONDS="${GH_BOUNCER_POLL_SECONDS:-3}"        # waiting for a run or a workflow to show up
+
+# --- output, the gh way ------------------------------------------------------------------
+# Messages go to stderr: ✓ green when done, X red when not, ! yellow for warnings, gray for
+# details. Colors only on a terminal, with NO_COLOR, CLICOLOR, CLICOLOR_FORCE and GH_FORCE_TTY
+# working as they do in gh.
+color=0
+case "${GH_FORCE_TTY:-}" in ''|0|false|no) tty=0 ;; *) tty=1 ;; esac
+[ ! -t 2 ] || tty=1
+if [ -n "${CLICOLOR_FORCE:-}" ] && [ "$CLICOLOR_FORCE" != 0 ]; then
+  color=1
+elif [ -z "${NO_COLOR:-}" ] && [ "${CLICOLOR:-}" != 0 ] && [ "$tty" = 1 ]; then
+  color=1
+fi
+if [ "$color" = 1 ]; then
+  C_OK=$'\e[32m' C_ERR=$'\e[31m' C_WARN=$'\e[33m' C_GRAY=$'\e[90m' C_OFF=$'\e[0m'
+else
+  C_OK='' C_ERR='' C_WARN='' C_GRAY='' C_OFF=''
+fi
+say()  { printf '%s\n' "$*" >&2; }
+ok()   { printf '%s✓%s %s\n' "$C_OK" "$C_OFF" "$*" >&2; }
+warn() { printf '%s!%s %s\n' "$C_WARN" "$C_OFF" "$*" >&2; }
+bad()  { printf '%sX%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2; }
+gray() { printf '  %s%s%s\n' "$C_GRAY" "$*" "$C_OFF" >&2; }
+hint() { local line; for line in "$@"; do [ -z "$line" ] || printf '  %s\n' "$line" >&2; done; }
+# die <what went wrong> [<what to do>...]
+die() { bad "$1"; shift; hint "$@"; exit 1; }
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# --- talking to GitHub -------------------------------------------------------------------------
+# ghc runs gh and keeps its error message for explanations, in a file so it survives $(...).
+ERRF="$(mktemp)"
+TEMP=("$ERRF")
+trap 'rm -rf "${TEMP[@]}"' EXIT
+ghc() { gh "$@" 2>"$ERRF"; }
+api() { ghc api "$@"; }
+gh_msg() { sed -e 's/^gh: //' "$ERRF" | grep -v '^[[:space:]]*$' | head -n 1; }
+is_404() { grep -q 'HTTP 404' "$ERRF"; }
+# reachable <gh exit code>: stop when gh isn't logged in (exit 4) or GitHub can't be reached
+reachable() {
+  if [ "$1" = 4 ] || grep -q 'gh auth login' "$ERRF"; then
+    bad "You're not logged in to GitHub CLI."
+    hint "Run gh auth login, then try again."
+    exit 4
+  fi
+  if grep -q 'HTTP 401' "$ERRF"; then
+    bad "Your GitHub CLI login has expired or was revoked."
+    hint "Run gh auth login, then try again."
+    exit 4
+  fi
+  if grep -qiE 'error connecting to|dial tcp|no such host|connection refused|network is unreachable|i/o timeout|TLS handshake' "$ERRF"; then
+    die "Couldn't connect to GitHub." "Check your internet connection, then try again."
+  fi
+}
+# gh_failed <gh exit code> [<message when not found> [<what to do>...]]
+gh_failed() {
+  local rc="$1"
+  shift
+  reachable "$rc"
+  if [ $# -gt 0 ] && is_404; then die "$@"; fi
+  die "GitHub returned an error: $(gh_msg)" "Try again in a minute. If it keeps happening, check https://www.githubstatus.com"
+}
 
 usage() {
-  cat <<'EOF'
-Usage:
+  cat <<EOF
+Run the bouncer review for your pull request, in your fork, on your own Anthropic API
+key, and tell the project's bouncer when it's done.
+
+USAGE
   gh bouncer [<pr-url> | <owner/repo#number> | <number>] [flags]
   gh bouncer init [-R OWNER/REPO]
 
-gh bouncer <pr> runs the bouncer review for your pull request in your fork,
-on your own Anthropic API key, and tells the project's gate when it's done.
 With no argument, it uses the pull request for the current branch.
+gh bouncer init is for maintainers: it opens a pull request that installs bouncer.
 
-gh bouncer init is for maintainers: it opens a pull request that installs
-bouncer in your repository.
-
-Flags:
+FLAGS
   -R, --repo OWNER/REPO   Upstream repository, when giving just a number
       --set-key           Replace the ANTHROPIC_API_KEY secret in your fork
       --no-watch          Start the review and exit without waiting for it
-  -h, --help              Show this help
+  -h, --help              Show help
   -v, --version           Show the version
 
-Environment:
-  ANTHROPIC_API_KEY       Stored as your fork's secret if it has none yet
+ENVIRONMENT
+  ANTHROPIC_API_KEY       Your Anthropic API key, used instead of asking when your fork
+                          needs one. It's stored only as an Actions secret in your fork.
+  NO_COLOR, CLICOLOR, CLICOLOR_FORCE, GH_FORCE_TTY
+                          Colors and terminal output, as in gh
+
+EXIT CODES
+  0  The review finished, or was started with --no-watch
+  1  Something went wrong, or the review run failed
+  4  Not logged in to GitHub CLI
+
+EXAMPLES
+  \$ gh bouncer https://github.com/acme/widget/pull/412
+  \$ gh bouncer acme/widget#412
+  \$ gh bouncer --set-key https://github.com/acme/widget/pull/412
+
+LEARN MORE
+  $SITE
+  https://github.com/gh-bouncer/gh-bouncer
 EOF
 }
 
-die() { printf 'gh bouncer: %s\n' "$*" >&2; exit 1; }
-say() { printf '%s\n' "$*" >&2; }
-
 # --- gh bouncer init: install bouncer in a repository (maintainers) ----------------
 init_usage() {
-  cat <<'EOF'
-Usage: gh bouncer init [-R OWNER/REPO]
+  cat <<EOF
+Open a pull request that installs bouncer in your repository.
 
-Opens a pull request in your repository that adds:
+USAGE
+  gh bouncer init [-R OWNER/REPO]
+
+FLAGS
+  -R, --repo OWNER/REPO   Repository to install bouncer in (default: the current one)
+  -h, --help              Show help
+
+It adds:
   .github/workflows/bouncer.yml   the gate, plus the review job forks inherit
   .bouncer.yml                    model, deadlines and rules (kept if it exists)
 EOF
 }
 
 INIT_REPO=""
-INIT_TMP=""
 ADDED=""
 
+drop_setup_branch() { gh api -X DELETE "repos/$INIT_REPO/git/refs/heads/$SETUP_BRANCH" >/dev/null 2>&1 || true; }
 # put_file <path in repo> <local file> <commit message> <keep existing: yes|no>
 put_file() {
-  local path="$1" src="$2" message="$3" keep="$4" existing out
-  existing="$(gh api -X GET "repos/$INIT_REPO/contents/$path" -f ref="$SETUP_BRANCH" --jq .sha 2>/dev/null || true)"
+  local path="$1" src="$2" message="$3" keep="$4" existing rc=0
+  existing="$(api -X GET "repos/$INIT_REPO/contents/$path" -f ref="$SETUP_BRANCH" --jq .sha)" || rc=$?
+  if [ "$rc" != 0 ]; then
+    is_404 || { drop_setup_branch; gh_failed "$rc"; }
+    existing=""
+  fi
   if [ -n "$existing" ] && [ "$keep" = "yes" ]; then
-    say "Keeping your existing $path."
+    ok "Kept your existing $path"
     return 0
   fi
   local args=(-X PUT "repos/$INIT_REPO/contents/$path" -f message="$message" -f branch="$SETUP_BRANCH"
     -f content="$(base64 <"$src" | tr -d '\n')")
   [ -z "$existing" ] || args+=(-f sha="$existing")
-  if ! out="$(gh api "${args[@]}" 2>&1)"; then
-    gh api -X DELETE "repos/$INIT_REPO/git/refs/heads/$SETUP_BRANCH" >/dev/null 2>&1 || true
-    case "$out" in
-      *workflow*) die "GitHub needs the 'workflow' permission to add workflow files. Run: gh auth refresh -s workflow, then gh bouncer init again." ;;
-      *) die "couldn't write $path: $out" ;;
-    esac
+  rc=0
+  api "${args[@]}" >/dev/null || rc=$?
+  if [ "$rc" != 0 ]; then
+    drop_setup_branch
+    reachable "$rc"
+    if grep -q 'workflow.*scope' "$ERRF"; then
+      die "Adding a workflow file needs the workflow scope on your gh login." \
+        "Run gh auth refresh -s workflow, then gh bouncer init again."
+    fi
+    die "Couldn't add $path to $INIT_REPO: $(gh_msg)" "Nothing was changed. Run gh bouncer init again."
   fi
+  ok "Added $path"
   ADDED="${ADDED}- \`$path\`"$'\n'
 }
 
@@ -79,40 +170,46 @@ cmd_init() {
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help) init_usage; exit 0 ;;
-      -R|--repo) [ $# -ge 2 ] || die "$1 needs OWNER/REPO"; INIT_REPO="$2"; shift 2 ;;
+      -R|--repo) [ $# -ge 2 ] || die "$1 needs a value: -R OWNER/REPO"; INIT_REPO="$2"; shift 2 ;;
       --repo=*) INIT_REPO="${1#--repo=}"; shift ;;
-      *) die "unknown argument: $1 (see gh bouncer init --help)" ;;
+      -*) die "Unknown flag: $1" "Run gh bouncer init --help for usage." ;;
+      *) die "Unknown argument: $1" "Run gh bouncer init --help for usage." ;;
     esac
   done
+  local rc=0
   if [ -z "$INIT_REPO" ]; then
-    INIT_REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)" ||
-      die "run this inside a clone of your repository, or pass -R OWNER/REPO"
+    INIT_REPO="$(ghc repo view --json nameWithOwner --jq .nameWithOwner)" || {
+      reachable $?
+      die "Not in a clone of a GitHub repository." "Run this in your project's folder, or pass -R OWNER/REPO."
+    }
   fi
+  case "$INIT_REPO" in */?*) ;; *) die "'$INIT_REPO' isn't a repository. Use -R OWNER/REPO." ;; esac
 
-  local is_admin is_fork default_branch
-  IFS=$'\t' read -r is_admin is_fork default_branch < <(
-    gh api "repos/$INIT_REPO" --jq '[(.permissions.admin // false), .fork, .default_branch] | @tsv' 2>/dev/null
-  ) || die "repository $INIT_REPO was not found"
-  [ "$is_admin" = "true" ] || die "you need admin rights on $INIT_REPO to install bouncer"
+  local info is_admin is_fork default_branch
+  info="$(api "repos/$INIT_REPO" --jq '[(.permissions.admin // false), .fork, .default_branch] | @tsv')" ||
+    gh_failed $? "Repository $INIT_REPO doesn't exist, or you can't see it." "Check the name, or pass -R OWNER/REPO."
+  IFS=$'\t' read -r is_admin is_fork default_branch <<<"$info"
+  [ "$is_admin" = "true" ] || die "You need admin rights on $INIT_REPO to install bouncer."
   [ "$is_fork" != "true" ] || die "$INIT_REPO is a fork. Run gh bouncer init in the project itself."
 
-  INIT_TMP="$(mktemp -d)"
-  trap 'rm -rf "$INIT_TMP"' EXIT
-  gh api "repos/$ACTION_REPO/contents/templates/bouncer.yml?ref=$ACTION_REF" \
-    -H "Accept: application/vnd.github.raw" >"$INIT_TMP/workflow" 2>/dev/null ||
-    die "couldn't download the bouncer workflow template from $ACTION_REPO"
-  gh api "repos/$ACTION_REPO/contents/templates/.bouncer.yml?ref=$ACTION_REF" \
-    -H "Accept: application/vnd.github.raw" >"$INIT_TMP/config" 2>/dev/null ||
-    die "couldn't download the .bouncer.yml template from $ACTION_REPO"
+  local tmp
+  tmp="$(mktemp -d)"
+  TEMP+=("$tmp")
+  api "repos/$ACTION_REPO/contents/templates/bouncer.yml?ref=$ACTION_REF" -H "Accept: application/vnd.github.raw" >"$tmp/workflow" ||
+    gh_failed $? "Couldn't find the bouncer workflow template in $ACTION_REPO@$ACTION_REF."
+  api "repos/$ACTION_REPO/contents/templates/.bouncer.yml?ref=$ACTION_REF" -H "Accept: application/vnd.github.raw" >"$tmp/config" ||
+    gh_failed $? "Couldn't find the .bouncer.yml template in $ACTION_REPO@$ACTION_REF."
 
   local base_sha
-  base_sha="$(gh api "repos/$INIT_REPO/git/ref/heads/$default_branch" --jq .object.sha 2>/dev/null)" ||
-    die "couldn't read $INIT_REPO's $default_branch branch"
-  gh api -X POST "repos/$INIT_REPO/git/refs" -f ref="refs/heads/$SETUP_BRANCH" -f sha="$base_sha" >/dev/null 2>&1 ||
-    die "couldn't create the $SETUP_BRANCH branch in $INIT_REPO. If it already exists, merge or delete it first."
+  base_sha="$(api "repos/$INIT_REPO/git/ref/heads/$default_branch" --jq .object.sha)" || gh_failed $?
+  api -X POST "repos/$INIT_REPO/git/refs" -f ref="refs/heads/$SETUP_BRANCH" -f sha="$base_sha" >/dev/null || {
+    rc=$?
+    reachable "$rc"
+    die "Couldn't create the $SETUP_BRANCH branch in $INIT_REPO: $(gh_msg)" "If it already exists, merge or delete it first."
+  }
 
-  put_file ".github/workflows/bouncer.yml" "$INIT_TMP/workflow" "Add bouncer workflow" no
-  put_file ".bouncer.yml" "$INIT_TMP/config" "Add bouncer settings" yes
+  put_file "$WORKFLOW_PATH" "$tmp/workflow" "Add bouncer workflow" no
+  put_file ".bouncer.yml" "$tmp/config" "Add bouncer settings" yes
 
   local body pr_url
   body="This installs [bouncer](https://github.com/gh-bouncer/gh-bouncer). Pull requests from people without write access are held until the contributor runs a signed review in their fork, on their own Anthropic API key. Maintainers pay nothing.
@@ -122,10 +219,14 @@ ${ADDED}
 Before merging, edit the \`rules\` and \`guidance\` in \`.bouncer.yml\` to match this project. Guidance about scope and what you never accept matters most.
 
 Members, collaborators, prior contributors and listed bots are exempt, and so is any pull request labeled \`bouncer:skip\`."
-  pr_url="$(gh pr create -R "$INIT_REPO" --base "$default_branch" --head "$SETUP_BRANCH" --title "Add bouncer" --body "$body")" ||
-    die "the files are on the $SETUP_BRANCH branch, but opening the pull request failed. Open it from https://github.com/$INIT_REPO/compare/$SETUP_BRANCH"
-  say "Opened $pr_url"
-  say "Edit the rules and guidance in .bouncer.yml on that branch, then merge it to turn bouncer on."
+  pr_url="$(ghc pr create -R "$INIT_REPO" --base "$default_branch" --head "$SETUP_BRANCH" --title "Add bouncer" --body "$body")" || {
+    rc=$?
+    reachable "$rc"
+    die "The files are on the $SETUP_BRANCH branch, but opening the pull request failed: $(gh_msg)" \
+      "Open it from https://github.com/$INIT_REPO/compare/$default_branch...$SETUP_BRANCH"
+  }
+  ok "Opened $pr_url"
+  gray "Edit the rules and guidance in .bouncer.yml on that branch, then merge it to turn bouncer on."
 }
 
 if [ "${1:-}" = "init" ]; then
@@ -141,13 +242,13 @@ WATCH=1
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
-    -v|--version) echo "gh-bouncer $VERSION"; exit 0 ;;
-    -R|--repo) [ $# -ge 2 ] || die "$1 needs OWNER/REPO"; UPSTREAM="$2"; shift 2 ;;
+    -v|--version) echo "gh bouncer version $VERSION"; exit 0 ;;
+    -R|--repo) [ $# -ge 2 ] || die "$1 needs a value: -R OWNER/REPO"; UPSTREAM="$2"; shift 2 ;;
     --repo=*) UPSTREAM="${1#--repo=}"; shift ;;
     --set-key) SET_KEY=1; shift ;;
     --no-watch) WATCH=0; shift ;;
-    -*) die "unknown flag: $1 (see gh bouncer --help)" ;;
-    *) [ -z "$ARG" ] || die "only one pull request at a time"; ARG="$1"; shift ;;
+    -*) die "Unknown flag: $1" "Run gh bouncer --help for usage." ;;
+    *) [ -z "$ARG" ] || die "Give one pull request at a time." "Run gh bouncer --help for usage."; ARG="$1"; shift ;;
   esac
 done
 
@@ -159,16 +260,19 @@ parse_url() {
   rest="${rest%%#*}"
   local host owner repo kind num
   IFS=/ read -r host owner repo kind num _ <<<"$rest"
-  [ "$kind" = "pull" ] && [ -n "$num" ] || die "not a pull request URL: $1"
-  [ "$host" = "github.com" ] || die "only github.com pull requests are supported"
+  [ "$host" = "github.com" ] || die "Only github.com pull requests are supported: $1"
+  [ "$kind" = "pull" ] && [ -n "$num" ] ||
+    die "Not a pull request URL: $1" "It should look like https://github.com/OWNER/REPO/pull/123"
   UPSTREAM="$owner/$repo"
   NUMBER="$num"
 }
 
 NUMBER=""
 if [ -z "$ARG" ]; then
-  url="$(gh pr view --json url --jq .url 2>/dev/null)" ||
-    die "no pull request found for the current branch. Pass its URL: gh bouncer https://github.com/OWNER/REPO/pull/123"
+  url="$(ghc pr view --json url --jq .url)" || {
+    reachable $?
+    die "No pull request found for the current branch." "Pass its URL: gh bouncer https://github.com/OWNER/REPO/pull/123"
+  }
   parse_url "$url"
 else
   case "$ARG" in
@@ -178,104 +282,121 @@ else
     *) NUMBER="$ARG" ;;
   esac
 fi
-case "$NUMBER" in ''|*[!0-9]*) die "'$NUMBER' is not a pull request number" ;; esac
+case "$NUMBER" in ''|*[!0-9]*) die "'$NUMBER' isn't a pull request number." "Pass the pull request's URL instead." ;; esac
 if [ -z "$UPSTREAM" ]; then
-  UPSTREAM="$(gh repo view --json nameWithOwner,parent \
-    --jq 'if .parent then "\(.parent.owner.login)/\(.parent.name)" else .nameWithOwner end' 2>/dev/null)" ||
-    die "can't tell which repository #$NUMBER is in. Pass the pull request URL instead."
+  UPSTREAM="$(ghc repo view --json nameWithOwner,parent \
+    --jq 'if .parent then "\(.parent.owner.login)/\(.parent.name)" else .nameWithOwner end')" || {
+    reachable $?
+    die "Can't tell which repository #$NUMBER is in." "Pass the pull request's URL, or add -R OWNER/REPO."
+  }
 fi
+case "$UPSTREAM" in */?*) ;; *) die "'$UPSTREAM' isn't a repository. Use -R OWNER/REPO." ;; esac
+REF="$UPSTREAM#$NUMBER"
 
-IFS=$'\t' read -r STATE HEAD_REPO HEAD_REF PR_URL < <(
-  gh api "repos/$UPSTREAM/pulls/$NUMBER" \
-    --jq '[.state, (.head.repo.full_name // "-"), .head.ref, .html_url] | @tsv' 2>/dev/null
-) || die "pull request $UPSTREAM#$NUMBER was not found"
-
-[ "$STATE" = "open" ] || die "$UPSTREAM#$NUMBER is $STATE. Reopen it first, then run gh bouncer again."
-[ "$HEAD_REPO" != "-" ] || die "the fork behind $UPSTREAM#$NUMBER was deleted"
-lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+info="$(api "repos/$UPSTREAM/pulls/$NUMBER" --jq '[.state, (.head.repo.full_name // "-"), .head.ref, .html_url] | @tsv')" ||
+  gh_failed $? "Pull request $REF doesn't exist, or you can't see it." "Check the URL and try again."
+IFS=$'\t' read -r STATE HEAD_REPO HEAD_REF PR_URL <<<"$info"
+[ "$STATE" = "open" ] || die "$REF is $STATE." "Reopen it, then run gh bouncer again."
+[ "$HEAD_REPO" != "-" ] || die "The fork behind $REF was deleted, so it can't be reviewed."
 [ "$(lower "$HEAD_REPO")" != "$(lower "$UPSTREAM")" ] ||
-  die "$UPSTREAM#$NUMBER comes from a branch in $UPSTREAM itself. Bouncer reviews pull requests from forks."
+  die "$REF comes from a branch in $UPSTREAM itself. Bouncer reviews pull requests from forks."
 
-IFS=$'\t' read -r IS_ADMIN DEFAULT_BRANCH < <(
-  gh api "repos/$HEAD_REPO" --jq '[(.permissions.admin // false), .default_branch] | @tsv'
-)
-[ "$IS_ADMIN" = "true" ] || die "you need admin rights on $HEAD_REPO (the fork) to run its review"
+# --- your fork -------------------------------------------------------------------------
+fork="$(api "repos/$HEAD_REPO" --jq '[(.permissions.admin // false), .default_branch] | @tsv')" ||
+  gh_failed $? "You can't see $HEAD_REPO, the fork $REF was opened from." "Only the pull request's author can run its review."
+IFS=$'\t' read -r IS_ADMIN DEFAULT_BRANCH <<<"$fork"
+[ "$IS_ADMIN" = "true" ] ||
+  die "You need admin rights on $HEAD_REPO, the fork $REF was opened from." "Only the pull request's author can run its review."
 
-say "Reviewing $PR_URL from $HEAD_REPO"
+say "Reviewing $REF from $HEAD_REPO"
 
 # --- the review workflow must exist on the fork's default branch -----------------
 has_workflow() {
-  gh api -X GET "repos/$HEAD_REPO/contents/$WORKFLOW_PATH" -f ref="$DEFAULT_BRANCH" --jq .path >/dev/null 2>&1
+  api -X GET "repos/$HEAD_REPO/contents/$WORKFLOW_PATH" -f ref="$DEFAULT_BRANCH" --jq .path >/dev/null
 }
 if ! has_workflow; then
   if [ "$HEAD_REF" = "$DEFAULT_BRANCH" ]; then
-    die "$HEAD_REPO's $DEFAULT_BRANCH branch doesn't have $WORKFLOW_PATH, and it's also your pull request's branch, so it won't be changed automatically. Merge the latest $UPSTREAM into it and push, then run gh bouncer again."
+    die "Your fork doesn't have the bouncer workflow yet, and gh bouncer won't change $DEFAULT_BRANCH because it's your pull request's branch." \
+      "Merge the latest $UPSTREAM into $HEAD_REPO:$DEFAULT_BRANCH and push, then run gh bouncer again."
   fi
-  say "Syncing $HEAD_REPO's $DEFAULT_BRANCH branch with $UPSTREAM to get the review workflow..."
-  gh api -X POST "repos/$HEAD_REPO/merge-upstream" -f branch="$DEFAULT_BRANCH" >/dev/null 2>&1 ||
-    die "couldn't sync $DEFAULT_BRANCH with $UPSTREAM. Use 'Sync fork' on https://github.com/$HEAD_REPO, then run gh bouncer again."
-  has_workflow || die "$UPSTREAM doesn't have $WORKFLOW_PATH on its default branch. Is bouncer installed there?"
+  say "Your fork doesn't have the bouncer workflow yet. Syncing $HEAD_REPO:$DEFAULT_BRANCH with $UPSTREAM..."
+  api -X POST "repos/$HEAD_REPO/merge-upstream" -f branch="$DEFAULT_BRANCH" >/dev/null || {
+    reachable $?
+    die "Couldn't sync $HEAD_REPO:$DEFAULT_BRANCH with $UPSTREAM: $(gh_msg)" \
+      "Use Sync fork on https://github.com/$HEAD_REPO, then run gh bouncer again."
+  }
+  has_workflow || die "$UPSTREAM has no $WORKFLOW_PATH on its default branch, so there's no review to run." \
+    "Bouncer may have been removed from the project. Ask its maintainers."
+  ok "Synced $HEAD_REPO:$DEFAULT_BRANCH with $UPSTREAM"
 fi
 
 # --- workflows in forks start switched off ----------------------------------------
-workflow_state() { gh api "repos/$HEAD_REPO/actions/workflows/$WORKFLOW" --jq .state 2>/dev/null || echo missing; }
+workflow_state() { api "repos/$HEAD_REPO/actions/workflows/$WORKFLOW" --jq .state || echo missing; }
 if [ "$(workflow_state)" != "active" ]; then
   gh api -X PUT "repos/$HEAD_REPO/actions/permissions" -F enabled=true -f allowed_actions=all >/dev/null 2>&1 || true
   gh api -X PUT "repos/$HEAD_REPO/actions/workflows/$WORKFLOW/enable" >/dev/null 2>&1 || true
   if [ "$(workflow_state)" != "active" ]; then
-    die "GitHub needs you to switch on workflows in your fork once. Open https://github.com/$HEAD_REPO/actions, click the button to enable them, then run gh bouncer again."
+    die "GitHub needs you to turn on workflows in your fork once, in the browser." \
+      "Open https://github.com/$HEAD_REPO/actions, click the button to enable them, then run gh bouncer again."
   fi
-  say "Turned on the review workflow in $HEAD_REPO."
+  ok "Turned on the review workflow in $HEAD_REPO"
 fi
 
 # --- the key lives only in the fork's secrets -------------------------------------------
-has_key="$(gh secret list -R "$HEAD_REPO" --json name --jq 'map(select(.name == "ANTHROPIC_API_KEY")) | length' 2>/dev/null || echo 0)"
+has_key="$(ghc secret list -R "$HEAD_REPO" --json name --jq 'map(select(.name == "ANTHROPIC_API_KEY")) | length' || echo 0)"
 if [ "$has_key" = "0" ] || [ "$SET_KEY" = "1" ]; then
   key="${ANTHROPIC_API_KEY:-}"
   if [ -z "$key" ]; then
-    [ -t 0 ] || die "no ANTHROPIC_API_KEY secret in $HEAD_REPO. Set ANTHROPIC_API_KEY in your environment, or run this in a terminal to be asked for it."
+    [ -t 0 ] || die "Your fork has no ANTHROPIC_API_KEY secret yet." \
+      "Set ANTHROPIC_API_KEY in your environment, or run gh bouncer in a terminal to be asked for it."
     printf 'Anthropic API key (stored only as a secret in %s): ' "$HEAD_REPO" >&2
-    IFS= read -rs key
+    IFS= read -rs key || true
     printf '\n' >&2
   fi
-  [ -n "$key" ] || die "no key given"
-  case "$key" in sk-ant-*) ;; *) say "That doesn't look like an Anthropic API key (they start with sk-ant-); storing it anyway." ;; esac
-  printf '%s' "$key" | gh secret set ANTHROPIC_API_KEY -R "$HEAD_REPO" >/dev/null
+  [ -n "$key" ] || die "No key entered. Your fork's secrets weren't changed."
+  case "$key" in sk-ant-*) ;; *) warn "That doesn't look like an Anthropic API key (they start with sk-ant-). Saving it anyway." ;; esac
+  rc=0
+  printf '%s' "$key" | ghc secret set ANTHROPIC_API_KEY -R "$HEAD_REPO" >/dev/null || rc=$?
   unset key
-  say "Stored ANTHROPIC_API_KEY as a secret in $HEAD_REPO. After this, pushes to your pull request are reviewed automatically."
+  [ "$rc" = 0 ] || { reachable "$rc"; die "Couldn't save the key in $HEAD_REPO: $(gh_msg)"; }
+  ok "Saved ANTHROPIC_API_KEY as an Actions secret in $HEAD_REPO"
+  gray "After this, pushes to your pull request are reviewed automatically."
 fi
 
 # --- start the review ----------------------------------------------------------------
 latest_run() {
-  gh run list -R "$HEAD_REPO" -w "$WORKFLOW" -e workflow_dispatch -L 20 --json databaseId \
-    --jq 'map(.databaseId) | max // 0' 2>/dev/null || echo 0
+  ghc run list -R "$HEAD_REPO" -w "$WORKFLOW" -e workflow_dispatch -L 20 --json databaseId \
+    --jq 'map(.databaseId) | max // 0' || echo 0
 }
 before="$(latest_run)"
-resp="$(gh api -X POST "repos/$HEAD_REPO/actions/workflows/$WORKFLOW/dispatches" \
-  -f ref="$DEFAULT_BRANCH" -f "inputs[pr]=$NUMBER" -F return_run_details=true 2>&1)" ||
-  die "couldn't start the review: $resp"
+resp="$(api -X POST "repos/$HEAD_REPO/actions/workflows/$WORKFLOW/dispatches" \
+  -f ref="$DEFAULT_BRANCH" -f "inputs[pr]=$NUMBER" -F return_run_details=true)" || {
+  reachable $?
+  die "GitHub wouldn't start the review: $(gh_msg)" "See https://github.com/$HEAD_REPO/actions/workflows/$WORKFLOW"
+}
 
-run_id="$(printf '%s' "$resp" | sed -n 's/.*"workflow_run_id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
-if [ -z "$run_id" ]; then
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    sleep "$POLL_SECONDS"
-    now="$(latest_run)"
-    if [ "$now" != "0" ] && [ "$now" -gt "$before" ]; then run_id="$now"; break; fi
-  done
-fi
-[ -n "$run_id" ] || die "the review started but its run didn't show up. See https://github.com/$HEAD_REPO/actions/workflows/$WORKFLOW"
+run_id="$(printf '%s' "$resp" | sed -n 's/.*"workflow_run_id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+i=0
+while [ -z "$run_id" ] && [ "$i" -lt 10 ]; do
+  sleep "$POLL_SECONDS"
+  now="$(latest_run)"
+  if [ "$now" -gt "$before" ]; then run_id="$now"; fi
+  i=$((i + 1))
+done
+[ -n "$run_id" ] || die "The review started, but its run didn't show up yet." \
+  "Follow it at https://github.com/$HEAD_REPO/actions/workflows/$WORKFLOW"
 
-RUN_URL="https://github.com/$HEAD_REPO/actions/runs/$run_id"
-say "Review running: $RUN_URL"
+ok "Started the review"
+gray "https://github.com/$HEAD_REPO/actions/runs/$run_id"
 if [ "$WATCH" = "0" ]; then
-  say "When it finishes, the gate picks it up within 10 minutes (or comment /bouncer check on $PR_URL)."
+  gray "The bouncer posts the result on $PR_URL within about 10 minutes of the review finishing."
   exit 0
 fi
 
-if ! gh run watch "$run_id" -R "$HEAD_REPO" --exit-status --interval 10 >&2; then
-  die "the review run failed. See why with: gh run view $run_id -R $HEAD_REPO --log-failed"
-fi
+gh run watch "$run_id" -R "$HEAD_REPO" --exit-status --interval 10 >&2 ||
+  die "The review run failed." "See why with: gh run view $run_id -R $HEAD_REPO --log-failed"
 
-gh pr comment "$NUMBER" -R "$UPSTREAM" --body "/bouncer check" >/dev/null ||
-  die "the review finished, but posting /bouncer check failed. The gate will still pick it up within 10 minutes."
-say "Done. The gate is checking your signed review now: $PR_URL"
+ghc pr comment "$NUMBER" -R "$UPSTREAM" --body "/bouncer check" >/dev/null ||
+  warn "Couldn't ask the bouncer to check right away. It checks every 10 minutes on its own."
+ok "Review finished. The bouncer is checking the signed review now."
+gray "The result will appear on $PR_URL"
