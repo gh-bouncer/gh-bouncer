@@ -731,6 +731,21 @@ find_review() {
     fi
   done <<<"$by_commit"
 }
+# has_attestation: does the fork already have a signed review of this commit, from any run (a
+# manual one, or one too old to be listed)? GitHub indexes attestations by the SHA-256 of their
+# subject, which every review of a pull request's commit shares (subject_name in the action's
+# bouncer/common.py). A 404 means there's none.
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d ' ' -f 1; }
+has_attestation() {
+  local digest count rc=0
+  digest="$(printf '%s' "bouncer-review/v1 $(lower "$UPSTREAM")#$NUMBER@$(lower "$HEAD_SHA")" | sha256)"
+  count="$(api "repos/$HEAD_REPO/attestations/sha256:$digest?per_page=1" --jq '.attestations | length')" || rc=$?
+  if [ "$rc" != 0 ]; then
+    is_404 || warn "Couldn't check whether your fork already has a signed review of this commit ($(gh_msg)). Starting one."
+    return 1
+  fi
+  case "$count" in ''|0|*[!0-9]*) return 1 ;; esac
+}
 newest_dispatch() {
   ghc run list -R "$HEAD_REPO" -w "$WORKFLOW" -e workflow_dispatch -L 20 --json databaseId \
     --jq 'map(.databaseId) | max // 0' || echo 0
@@ -806,11 +821,21 @@ run_failed() {
 }
 
 find_review
+# Not even a finished run? Then look for the signed review itself, unless the bouncer said the
+# last one doesn't count.
+case "$RUN_HOW:$NOTE" in
+  :config_changed|:outdated) ;;
+  :*) if has_attestation; then RUN_HOW="attested"; fi ;;
+esac
 case "$RUN_HOW" in
   running) ok "A review of this commit is already running in your fork. Following it instead of starting another." ;;
   signed)
     ok "Your fork already reviewed this commit, and GitHub signed it."
     gray "https://github.com/$HEAD_REPO/actions/runs/$RUN_ID" ;;
+  attested)
+    ok "Your fork already has a signed review of this commit, so gh bouncer isn't starting another."
+    gray "Only the first signed review of a commit counts."
+    RUN_HOW="signed" ;;
   *) start_review ;;
 esac
 while [ "$RUN_HOW" != "signed" ]; do

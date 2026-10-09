@@ -35,7 +35,7 @@ gh bouncer https://github.com/OWNER/REPO/pull/123
 2. It makes sure your fork has the project's workflow, syncing your fork's default branch with the project if needed. It never touches your pull request's branch.
 3. It turns on GitHub Actions in your fork (forks start with them off). If GitHub insists on a one-time click in the browser, it tells you where.
 4. The first time, it asks for your Anthropic API key (or takes `ANTHROPIC_API_KEY` from your environment) and stores it as the `ANTHROPIC_API_KEY` Actions secret in your fork. It tells you which model and effort the project reviews with, since every review is billed to your key, and refuses anything that isn't an Anthropic key. The key never appears on a command line and never leaves your fork's secrets.
-5. It starts the review and follows it. If a review of the same commit is already running in your fork, or one already finished and was signed, it uses that one instead of paying for another: only the first signed review of a commit counts anyway.
+5. It starts the review and follows it. If a review of the same commit is already running in your fork, or one already finished and was signed (it also looks for the signed review itself, in your fork's attestations), it uses that one instead of paying for another: only the first signed review of a commit counts anyway.
 6. When the review is signed, it comments `/bouncer check` so the bouncer looks right away, waits for the result and shows it: passed, or bounced with the reasons, the review attempts you have left, and how to try again.
 
 If the review run fails (an invalid key, no credits left, rate limits...), it says why. Nothing was signed, so it doesn't use up a review attempt.

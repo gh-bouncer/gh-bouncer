@@ -6,6 +6,7 @@
 #   S_VERDICT  the state JSON after /bouncer check (default: passed)
 #   S_LABELS   the pull request's labels, comma-separated (default: bouncer:pending)
 #   S_ANNOTATION  the review's failure annotation
+# Flags include attested (the fork has a signed review of the commit) and attestations_fail.
 #   HEAD_REF, DEFAULT_BRANCH
 printf '%s\n' "$*" >>"$STUB/calls.log"
 [ -z "${ANTHROPIC_API_KEY:-}" ] || echo "LEAK: ANTHROPIC_API_KEY in gh's environment" >>"$STUB/calls.log"
@@ -28,6 +29,8 @@ HR="${HEAD_REF:-feature}"
 SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 PR_URL=https://github.com/up/repo/pull/7
 REPORT="$PR_URL#issuecomment-2002"
+# What the action's bouncer/common.py gives: subject_digest(subject_name("up/repo", 7, SHA))
+DIGEST=e08c3044262ea7ac9be0c017d9c7adb6f15a3ba459108d384c782c58637a94bb
 PENDING='{"v":1,"sha":"'$SHA'","status":"pending","fails":0,"left":3,"deadline":"2026-10-11T12:00:00Z","report":"","model":"claude-opus-5-5","effort":"high"}'
 PASSED='{"v":1,"sha":"'$SHA'","status":"pass","fails":0,"left":3,"report":"'$REPORT'","model":"claude-opus-5-5","effort":"high"}'
 
@@ -157,6 +160,10 @@ case "$*" in
     done
     runs | jq --arg c "$commit" --arg e "$event" \
       '[.[] | select(($c == "" or .headSha == $c) and ($e == "" or .event == $e))] | sort_by(-.databaseId)' | out ;;
+  "api repos/fork/repo/attestations/sha256:$DIGEST?per_page=1 "*)
+    flag attestations_fail && fail "gh: Server Error (HTTP 502)"
+    flag attested || not_found
+    echo '{"attestations":[{"bundle":{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json"},"repository_id":1001}]}' | out ;;
   "api -X POST repos/fork/repo/actions/workflows/bouncer.yml/dispatches "*)
     if flag dispatch_old_workflow && [[ "$*" == *"inputs[upstream]"* ]]; then fail 'gh: Unexpected inputs provided: ["upstream"] (HTTP 422)'; fi
     flag dispatch_no_trigger && fail "gh: Workflow does not have 'workflow_dispatch' trigger (HTTP 422)"

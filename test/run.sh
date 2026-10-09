@@ -99,6 +99,10 @@ check() {  # extra assertions per test
     follow-manual-run) [ "$(dispatches)" = 0 ] && called '^run watch 3232 ' ;;
     other-pr-run|skipped-push-run|config-changed-rerun) [ "$(dispatches)" = 1 ] && called '^run watch 4242 ' ;;
     reuse-signed-run) [ "$(dispatches)" = 0 ] && ! called '^run watch' && called '^pr comment' && has "Passed." ;;
+    reuse-attestation) [ "$(dispatches)" = 0 ] && ! called '^run watch' && [ "$(grep -c '^pr comment' "$STUB/calls.log")" = 1 ] &&
+                       has "Passed." ;;
+    reuse-attestation-no-watch) [ "$(dispatches)" = 0 ] && called '^pr comment' ;;
+    attestation-check-fails) [ "$(dispatches)" = 1 ] && has "Passed." ;;
     followed-run-skipped) called '^run watch 3131 ' && called '^run watch 4242 ' && [ "$(dispatches)" = 1 ] && has "Passed." ;;
     outdated-syncs) called 'merge-upstream' && [ "$(dispatches)" = 1 ] ;;
     run-out-of-credits) has "Nothing was signed, so this doesn't use up a review attempt." &&
@@ -216,9 +220,12 @@ run follow-manual-run   0 "Following it instead of starting another"          ha
 run other-pr-run        0 "Started the review"                                has_secret run_other_pr_running -- "$URL"
 run reuse-signed-run    0 "Your fork already reviewed this commit"            has_secret run_push_signed -- "$URL"
 run skipped-push-run    0 "Started the review"                                has_secret run_push_skipped -- "$URL"
+run reuse-attestation   0 "Your fork already has a signed review of this commit" has_secret attested -- "$URL"
+NOT="Started" run reuse-attestation-no-watch 0 "The bouncer posts the result on $URL" has_secret attested -- --no-watch "$URL"
+run attestation-check-fails 0 "Couldn't check whether your fork already has a signed review of this commit (Server Error (HTTP 502))" has_secret attestations_fail -- "$URL"
 run followed-run-skipped 0 "That run didn't review your pull request"         has_secret run_push_running followed_run_skips -- "$URL"
-S_STATE="$(st pending '"note":"config_changed"')" run config-changed-rerun 0 "doesn't count: the maintainers changed the bouncer settings" has_secret run_push_signed -- "$URL"
-S_STATE="$(st pending '"note":"outdated"')" run outdated-syncs 0 "Your fork's bouncer workflow may be out of date. Syncing" has_secret -- "$URL"
+S_STATE="$(st pending '"note":"config_changed"')" run config-changed-rerun 0 "doesn't count: the maintainers changed the bouncer settings" has_secret run_push_signed attested -- "$URL"
+S_STATE="$(st pending '"note":"outdated"')" run outdated-syncs 0 "Your fork's bouncer workflow may be out of date. Syncing" has_secret attested -- "$URL"
 ctrl_c ctrl-c-watching "run watch" "Stopped watching. The review is still running: https://github.com/fork/repo/actions/runs/4242" has_secret slow_watch -- "$URL"
 
 # --- when the review run fails: say why, and that nothing was used up
