@@ -3,6 +3,7 @@
 # --jq filter with real jq, so the script's filters are tested too. Behavior is controlled by
 # flag files in $STUB and a few variables:
 #   S_STATE    the bouncer's state JSON before /bouncer check ("none": no state comment)
+#   S_VERDICT  the state JSON after /bouncer check (default: passed)
 #   S_LABELS   the pull request's labels, comma-separated (default: bouncer:pending)
 #   S_ANNOTATION  the review's failure annotation
 #   HEAD_REF, DEFAULT_BRANCH
@@ -26,10 +27,12 @@ DB="${DEFAULT_BRANCH:-main}"
 HR="${HEAD_REF:-feature}"
 SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 PR_URL=https://github.com/up/repo/pull/7
+REPORT="$PR_URL#issuecomment-2002"
 PENDING='{"v":1,"sha":"'$SHA'","status":"pending","fails":0,"left":3,"deadline":"2026-10-11T12:00:00Z","report":"","model":"claude-opus-5-5","effort":"high"}'
+PASSED='{"v":1,"sha":"'$SHA'","status":"pass","fails":0,"left":3,"report":"'$REPORT'","model":"claude-opus-5-5","effort":"high"}'
 
 state() {
-  printf '%s' "${S_STATE:-$PENDING}"
+  if flag checked && ! flag verdict_pending; then printf '%s' "${S_VERDICT:-$PASSED}"; else printf '%s' "${S_STATE:-$PENDING}"; fi
 }
 comments() {
   local st; st="$(state)"
@@ -46,6 +49,7 @@ pr() {
   local st=open merged=null head=fork/repo
   flag pr_closed && st=closed
   flag pr_merged && { st=closed; merged='"2026-10-08T10:00:00Z"'; }
+  if flag checked && ! flag keep_open && [ "$(state | jq -r .status)" = fail ]; then st=closed; fi
   flag pr_from_upstream && head=up/repo
   flag fork_deleted && head=""
   jq -n --arg st "$st" --argjson merged "$merged" --arg head "$head" --arg ref "$HR" --arg sha "$SHA" \
@@ -158,7 +162,7 @@ case "$*" in
       jq -n --arg m "${S_ANNOTATION:-Your Anthropic account is out of credits. Add credits at https://console.anthropic.com/settings/billing, then run gh bouncer $PR_URL again.}" \
         '[{annotation_level: "failure", message: "Process completed with exit code 1."}, {annotation_level: "notice", message: "bouncer abc"}, {annotation_level: "failure", message: $m}]'
     fi | out ;;
-  "pr comment 7 -R up/repo --body /bouncer check") touch "$STUB/checked" ;;
+  "pr comment 7 -R up/repo --body /bouncer check") flag comment_fails && fail "HTTP 403"; touch "$STUB/checked" ;;
 
   # --- init ---
   "api repos/me/proj --jq"*)

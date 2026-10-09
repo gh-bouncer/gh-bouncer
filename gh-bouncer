@@ -12,6 +12,8 @@ SETUP_BRANCH="bouncer-setup"
 SITE="https://gh-bouncer.com"
 KEYS_URL="https://console.anthropic.com/settings/keys"
 POLL_SECONDS="${GH_BOUNCER_POLL_SECONDS:-3}"        # waiting for a run or a workflow to show up
+VERDICT_SECONDS="${GH_BOUNCER_VERDICT_SECONDS:-10}" # polling the bouncer's state for the result
+VERDICT_TRIES="${GH_BOUNCER_VERDICT_TRIES:-18}"     # about 3 minutes
 
 # The key is read once and kept out of the environment of every command this script runs.
 ENV_KEY="${ANTHROPIC_API_KEY:-}"
@@ -30,9 +32,9 @@ elif [ -z "${NO_COLOR:-}" ] && [ "${CLICOLOR:-}" != 0 ] && [ "$tty" = 1 ]; then
   color=1
 fi
 if [ "$color" = 1 ]; then
-  C_OK=$'\e[32m' C_ERR=$'\e[31m' C_WARN=$'\e[33m' C_GRAY=$'\e[90m' C_OFF=$'\e[0m'
+  C_OK=$'\e[32m' C_ERR=$'\e[31m' C_WARN=$'\e[33m' C_GRAY=$'\e[90m' C_BOLD=$'\e[1m' C_OFF=$'\e[0m'
 else
-  C_OK='' C_ERR='' C_WARN='' C_GRAY='' C_OFF=''
+  C_OK='' C_ERR='' C_WARN='' C_GRAY='' C_BOLD='' C_OFF=''
 fi
 say()  { printf '%s\n' "$*" >&2; }
 ok()   { printf '%s✓%s %s\n' "$C_OK" "$C_OFF" "$*" >&2; }
@@ -82,7 +84,7 @@ gh_failed() {
 usage() {
   cat <<EOF
 Run the bouncer review for your pull request, in your fork, on your own Anthropic API
-key, and tell the project's bouncer when it's done.
+key. The project's bouncer then checks the signed review and posts the result.
 
 USAGE
   gh bouncer [<pr-url> | <owner/repo#number> | <number>] [flags]
@@ -94,7 +96,7 @@ gh bouncer init is for maintainers: it opens a pull request that installs bounce
 FLAGS
   -R, --repo OWNER/REPO   Upstream repository, when giving just a number
       --set-key           Replace the ANTHROPIC_API_KEY secret in your fork
-      --no-watch          Start the review and exit without waiting for it
+      --no-watch          Start the review and exit without waiting for the result
   -h, --help              Show help
   -v, --version           Show the version
 
@@ -105,8 +107,8 @@ ENVIRONMENT
                           Colors and terminal output, as in gh
 
 EXIT CODES
-  0  The review finished, or was started with --no-watch
-  1  Something went wrong, or the review run failed
+  0  Passed, nothing to do, or the result isn't in yet
+  1  Bounced, or something went wrong
   2  Stopped with Ctrl-C (the review keeps running)
   4  Not logged in to GitHub CLI
 
@@ -819,14 +821,33 @@ while [ "$RUN_HOW" != "signed" ]; do
   RUN_HOW="signed"
 done
 
-# --- tell the project's bouncer ---------------------------------------------------------------
+# --- the result comes from the project's bouncer, once it has verified the signature -----------
 ghc pr comment "$NUMBER" -R "$UPSTREAM" --body "/bouncer check" >/dev/null ||
   warn "Couldn't ask the bouncer to check right away. It checks every 10 minutes on its own."
 if [ "$WATCH" = 0 ]; then
   gray "The bouncer posts the result on $PR_URL"
   exit 0
 fi
-gray "The bouncer is checking it now. The result will appear on $PR_URL"
+stopped_waiting() {
+  say ""
+  warn "Stopped waiting. The bouncer posts the result on $PR_URL"
+  exit 2
+}
+say "Waiting for the bouncer to verify the review and post the result..."
+trap stopped_waiting INT
+RESULT=""   # the bouncer's status for this commit, once it isn't pending
+i=0
+while [ "$i" -lt "$VERDICT_TRIES" ]; do
+  [ "$i" = 0 ] || sleep "$VERDICT_SECONDS"
+  i=$((i + 1))
+  load_state || continue
+  [ "$B_SHA" = "$HEAD_SHA" ] || continue
+  # A new note means the bouncer looked and the review doesn't count. Unknown statuses: keep waiting.
+  if [ "$B_STATUS" = "pending" ] && [ -n "$B_NOTE" ] && [ "$B_NOTE" != "$NOTE" ]; then RESULT="note"; break; fi
+  if [ "$B_STATUS" != "pending" ] && known_status "$B_STATUS"; then RESULT="$B_STATUS"; break; fi
+done
+trap - INT
+say ""
 
 auto_note() {
   if [ -n "$AUTO" ]; then
@@ -836,4 +857,63 @@ auto_note() {
     gray "Merge the latest $UPSTREAM into it to change that, or run gh bouncer again after each push."
   fi
 }
-auto_note
+# The bouncer closes a bounced pull request right after saving its verdict, unless the project
+# keeps them open, so give it a moment.
+pr_closed_now() {
+  local state="open" i=0
+  while [ "$state" = "open" ] && [ "$i" -lt 3 ]; do
+    [ "$i" = 0 ] || sleep "$POLL_SECONDS"
+    state="$(api "repos/$UPSTREAM/pulls/$NUMBER" --jq .state || echo open)"
+    i=$((i + 1))
+  done
+  [ "$state" != "open" ]
+}
+case "$RESULT" in
+  pass|override)
+    ok "${C_BOLD}Passed.${C_OFF} $REF is ready for a maintainer."
+    [ -z "$B_REPORT" ] || gray "Review: $B_REPORT"
+    auto_note
+    exit 0 ;;
+  fail)
+    closed=""
+    if pr_closed_now; then
+      closed=1
+      bad "${C_BOLD}Bounced.${C_OFF} $REF was closed."
+    else
+      bad "${C_BOLD}Bounced.${C_OFF} $REF stays open for a maintainer to confirm."
+    fi
+    show_reasons
+    show_report
+    say ""
+    if [ -n "$closed" ]; then
+      retry_steps
+    elif [ "$B_LEFT" = 0 ]; then
+      no_attempts_left
+    elif [ -n "$AUTO" ]; then
+      say "To try again$(attempts_left): push your fixes as new commits. A new review starts on your key automatically."
+    else
+      say "To try again$(attempts_left): push your fixes as new commits, then run gh bouncer again."
+    fi
+    exit 1 ;;
+  exhausted) die "$REF used all its review attempts and was closed." "A maintainer can still reopen it if they'd like to take a look." ;;
+  expired) die "$REF was closed: the deadline passed before the bouncer saw the review." \
+    "Reopen it, and the bouncer checks the review you just ran." ;;
+  wrong_base) if pr_closed_now; then wrong_base yes; else wrong_base no; fi ;;
+  note)
+    case "$B_NOTE" in
+      config_changed) die "Your review doesn't count: $(note_explained "$B_NOTE")." \
+        "Run gh bouncer $PR_URL again. This doesn't use up a review attempt." ;;
+      outdated) die "Your review doesn't count: $(note_explained "$B_NOTE")." \
+        "Run gh bouncer $PR_URL again: it syncs your fork first. This doesn't use up a review attempt." ;;
+      verify_error) warn "The bouncer couldn't verify your signed review yet. It tries again every 10 minutes." ;;
+      *) warn "The bouncer hasn't posted the result yet. It says: $B_NOTE" ;;
+    esac ;;
+  *)
+    if [ "$B_SHA" = "$HEAD_SHA" ] && [ -n "$B_STATUS" ] && ! known_status "$B_STATUS"; then
+      warn "The bouncer says \"$B_STATUS\", which this version of gh bouncer doesn't know."
+      gray "Updating may help: gh extension upgrade bouncer"
+    else
+      warn "The bouncer hasn't posted the result yet. It checks every 10 minutes."
+    fi ;;
+esac
+gray "The result will appear on $PR_URL"
